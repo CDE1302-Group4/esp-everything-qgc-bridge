@@ -1,5 +1,6 @@
 """Mission planning, pose transforms and flight failures, without flight hardware."""
 
+import csv
 import json
 import math
 from pathlib import Path
@@ -248,7 +249,8 @@ def test_recorder_stale_camera_fails():
 
 
 @pytest.mark.parametrize("include_rejected", [False, True])
-def test_camera_jpeg_to_detection_journal(tmp_path, monkeypatch, include_rejected):
+@pytest.mark.parametrize("suffix", [".csv", ".jsonl"])
+def test_camera_jpeg_to_detection_journal(tmp_path, monkeypatch, include_rejected, suffix):
     """Exercise JPEG recording with a real tag and with mixed repeated sightings."""
     cv2 = pytest.importorskip("cv2")
     np = pytest.importorskip("numpy")
@@ -263,7 +265,7 @@ def test_camera_jpeg_to_detection_journal(tmp_path, monkeypatch, include_rejecte
     tracker = tags.PoseTracker(22)
     tracker.callback(packet(), "drone")
     frame = Frame(7, jpeg.tobytes(), 20, 0, tags.time.monotonic())
-    path = tmp_path / "camera.jsonl"
+    path = tmp_path / ("camera" + suffix)
     journal = tags.Journal(path)
     recorder = tags.TagRecorder("drone", 5006, tracker, journal)
     recorder.set_phase("exploring")
@@ -284,30 +286,44 @@ def test_camera_jpeg_to_detection_journal(tmp_path, monkeypatch, include_rejecte
     def receive(*args):
         nonlocal frame_count
         frame_count += 1
-        if frame_count == (2 if include_rejected else 1):
+        if frame_count == 3:
             recorder._stop.set()
-        return Frame(6 + frame_count, frame.jpeg, frame.age_ms, frame.esp_drops, frame.first_rx), 1, None
+        return Frame(6 + frame_count, frame.jpeg, frame.age_ms, frame.esp_drops,
+                     frame.first_rx + frame_count * 0.001), 1, None
 
     monkeypatch.setattr(tags, "drain_socket", receive)
     try:
         recorder._run()
         recorder.check_health()
+        assert tx.sendto.call_args.args == (build_camera_stream_command(False), ("drone", 5006))
+        if suffix == ".csv":
+            with path.open(newline="") as source:
+                rows = list(csv.DictReader(source))
+            assert len(rows) == 1
+            assert rows[0]["tag_id"] == "5"
+            assert set(rows[0]) == {"tag_id", "local_x_m", "local_y_m", "local_z_m"}
+            assert rows[0]["local_x_m"] and rows[0]["local_y_m"]
+            return
         records = [json.loads(line) for line in path.read_text().splitlines()]
-        assert len(records) == (6 if include_rejected else 1)
+        assert len(records) == (9 if include_rejected else 3)
         assert records[0]["tag_id"] == 5
         assert records[0]["frame_id"] == 7
         assert records[0]["phase"] == "exploring"
         assert records[0]["local_position_ned_m"][:2] != [None, None]
         assert records[0]["frame_received_utc"].endswith("+00:00")
         assert all(r["timestamp_utc"].endswith("+00:00") for r in records)
+        confirmed = [r for r in records if r["type"] == "detection"]
+        assert [(r["tag_id"], r["frame_id"]) for r in confirmed] == [(5, 9)]
+        assert confirmed[0]["mission_accepted"] is True
+        assert confirmed[0]["confirmation_count"] == 3
+        assert records[0]["type"] == "detection_candidate"
         if include_rejected:
-            assert [r["tag_id"] for r in records] == [5, 7, 9, 5, 7, 9]
-            assert [r["frame_id"] for r in records] == [7, 7, 7, 8, 8, 8]
+            assert [r["tag_id"] for r in records] == [5, 7, 9] * 3
+            assert records[1]["type"] == records[2]["type"] == "detection_rejected"
             assert records[1]["quality_accepted"] is False
             assert records[1]["local_position_ned_m"] is None
             assert records[2]["pose_valid"] is False
             assert records[2]["local_position_ned_m"] is None
-        assert tx.sendto.call_args.args == (build_camera_stream_command(False), ("drone", 5006))
     finally:
         journal.close()
 

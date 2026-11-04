@@ -1,7 +1,8 @@
 """Headless camera detection and timestamped local-frame mission records.
 
-Uses the same detector, camera mount, quality gate and JPEG assembly as
-tag_stream.py. Telemetry and camera clocks are not synchronized: positions
+Uses the same detector, camera mount and JPEG assembly as tag_stream.py,
+with stricter mission acceptance and confirmation across frames.
+Telemetry and camera clocks are not synchronized: positions
 are associated by laptop receipt time, with the time mismatch logged.
 """
 
@@ -23,6 +24,7 @@ from apriltag_host import Detector, POSE_ERR_LIMIT, gate_reason
 from camera_stream import FrameAssembler, KEEPALIVE_S, drain_socket
 from protocol import CAMERA_STREAM_PORT, build_camera_stream_command
 from simple_waypoint_mission import TelemetrySnapshot, TelemetryTracker
+from tag_acceptance import TagAcceptance
 
 
 class PoseTracker(TelemetryTracker):
@@ -57,53 +59,23 @@ class PoseTracker(TelemetryTracker):
         return TelemetrySnapshot()
 
 
-CSV_SCALAR_FIELDS = (
-    "type", "timestamp_utc", "drone_id", "phase", "tag_id", "tag_family",
-    "frame_id", "camera_boot_nonce", "frame_received_utc", "frame_received_monotonic_s",
-    "camera_age_ms", "camera_dropped_frames", "hamming", "decision_margin",
-    "quality_accepted", "quality_rejection_reason", "pose_valid", "pose_error",
-    "camera_range_m", "localization_status", "uav_heading_rad", "telemetry_age_at_frame_s",
-    "assumed_altitude_m", "reached", "search_complete", "landing_confirmed",
-)
-CSV_VECTOR_FIELDS = {
-    "image_center_px": ("image_center_x_px", "image_center_y_px"),
-    "image_corners_px": tuple(f"image_corner_{i}_{axis}_px" for i in range(4) for axis in ("x", "y")),
-    "relative_camera_translation_m": ("camera_x_m", "camera_y_m", "camera_z_m"),
-    "relative_body_translation_m": ("body_forward_m", "body_right_m", "body_down_m"),
-    "local_position_ned_m": ("local_x_m", "local_y_m", "local_z_m"),
-    "uav_local_xy_m": ("uav_local_x_m", "uav_local_y_m"),
-    "local_xy_m": ("goal_local_x_m", "goal_local_y_m"),
-    "command_xy_m": ("command_x_m", "command_y_m"),
-    "home_local_xy_m": ("home_local_x_m", "home_local_y_m"),
-    **{field: tuple(f"{prefix}_r{i}{j}" for i in range(3) for j in range(3))
-       for field, prefix in (("relative_camera_rotation_row_major", "camera"),
-                             ("relative_body_rotation_row_major", "body"),
-                             ("local_rotation_row_major", "local"))},
-}
-CSV_FIELDS = (*CSV_SCALAR_FIELDS,
-              *(column for columns in CSV_VECTOR_FIELDS.values() for column in columns),
-              "details_json")
+CSV_FIELDS = ("tag_id", "local_x_m", "local_y_m", "local_z_m")
 
 
 def csv_record(record):
-    """Flatten poses for spreadsheets; retain other mission metadata as JSON."""
-    row = {key: record[key] for key in CSV_SCALAR_FIELDS if key in record}
-    for field, columns in CSV_VECTOR_FIELDS.items():
-        values = record.get(field)
-        if values is not None:
-            if field == "image_corners_px":
-                values = tuple(value for corner in values for value in corner)
-            if len(values) != len(columns):
-                raise ValueError(f"{field}: expected {len(columns)} values")
-            row.update(zip(columns, values))
-    extra = {key: value for key, value in record.items()
-             if key not in CSV_SCALAR_FIELDS and key not in CSV_VECTOR_FIELDS}
-    row["details_json"] = json.dumps(extra, allow_nan=False) if extra else ""
-    return row
+    """Only tag IDs and local NED coordinates belong in the compact CSV."""
+    if record["type"] != "detection":
+        return None
+    position = record.get("local_position_ned_m")
+    if position is None:
+        position = (None, None, None)
+    if len(position) != 3:
+        raise ValueError("local_position_ned_m: expected 3 values")
+    return dict(zip(CSV_FIELDS, (record["tag_id"], *position)))
 
 
 class Journal:
-    """CSV for .csv paths, otherwise JSONL; flush every event/detection."""
+    """Compact tag CSV or detailed JSONL; flush each saved record."""
 
     def __init__(self, path):
         self._file = open(path, "x", encoding="utf-8", newline="")
@@ -121,8 +93,13 @@ class Journal:
     def write(self, kind, **fields):
         record = {"type": kind, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                   **fields}
-        line = json.dumps(record, allow_nan=False)
-        row = csv_record(record) if self._csv is not None else None
+        if self._csv is not None:
+            row = csv_record(record)
+            if row is None:
+                return
+            json.dumps(row, allow_nan=False)  # Reject non-finite output coordinates.
+        else:
+            line = json.dumps(record, allow_nan=False)
         with self._lock:
             if self._csv is not None:
                 self._csv.writerow(row)
@@ -201,11 +178,13 @@ def detection_record(det, snapshot, frame_received_at, assumed_altitude=None):
 
 class TagRecorder:
     def __init__(self, esp_ip, cmd_port, tracker, journal, *, fps=5, quality=60,
-                 pose_max_age=0.5, camera_timeout=3.0, assumed_altitude=None):
+                 pose_max_age=0.5, camera_timeout=3.0, assumed_altitude=None,
+                 tag_min_margin=80.0, tag_confirm_frames=3, tag_ids=None):
         self.esp_ip, self.cmd_port = esp_ip, cmd_port
         self.tracker, self.journal = tracker, journal
         self.pose_max_age, self.camera_timeout = pose_max_age, camera_timeout
         self.assumed_altitude = assumed_altitude
+        self._acceptance = TagAcceptance(tag_min_margin, tag_confirm_frames, tag_ids)
         self._phase = "preflight"
         self._start_command = build_camera_stream_command(True, fps, quality)
         self._stop = threading.Event()
@@ -272,14 +251,17 @@ class TagRecorder:
                         receipt_utc = datetime.fromtimestamp(
                             time.time() - (time.monotonic() - frame.first_rx), timezone.utc).isoformat()
                         altitude = self.assumed_altitude if phase in ("exploring", "returning") else None
-                        for det in detector.detect(gray):
+                        observations = [detection_record(det, snapshot, frame.first_rx, altitude)
+                                        for det in detector.detect(gray)]
+                        for kind, record in self._acceptance.process_frame(
+                                observations, (assembler.nonce, frame.frame_id), frame.first_rx):
                             self.journal.write(
-                                "detection", drone_id=self.tracker.drone_id, phase=phase,
+                                kind, drone_id=self.tracker.drone_id, phase=phase,
                                 frame_id=frame.frame_id, camera_boot_nonce=assembler.nonce,
                                 frame_received_utc=receipt_utc,
                                 frame_received_monotonic_s=frame.first_rx,
                                 camera_age_ms=frame.age_ms, camera_dropped_frames=assembler.dropped,
-                                **detection_record(det, snapshot, frame.first_rx, altitude))
+                                **record)
                         self._last_frame = frame.first_rx
                         self._ready.set()
                 finally:

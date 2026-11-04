@@ -149,8 +149,9 @@ tag size, camera intrinsics, and camera mount must match `apriltag_host.py`
 Exploration records default to a timestamped `exploration_*.csv` in the working
 directory. `--log name.csv` selects CSV, and `--log name.jsonl` selects JSONL.
 Records are appended to a new file and flushed after each record; an existing
-file is never overwritten. Every decoded detection in a
-processed frame includes:
+file is never overwritten. CSV contains only the tag number and local
+coordinates. For detailed recording, JSONL includes the following for each
+decoded detection in a processed frame:
 
 - Tag ID/family, quality metrics and acceptance/rejection reason, frame ID,
   camera boot nonce, and mission phase.
@@ -161,19 +162,33 @@ processed frame includes:
 - Estimated tag position and orientation in local NED, UAV XY/heading, and
   the telemetry/image receipt-time difference used for localization.
 
-CSV has one header and one row per event or detection. Filter the `type` column
-to `detection` to see tag observations. Positions use separate columns such as
-`local_x_m`, `local_y_m`, `local_z_m`, `body_forward_m`, and `camera_range_m`.
-Unknown values are blank, and rotations are split into `camera_r00` through
-`camera_r22` (and corresponding `body_`/`local_` columns). Extra mission metadata,
-including the full planned waypoint list, is preserved in `details_json`.
-JSONL retains the original nested record format.
+CSV has just four columns, with one row per confirmed tag observation:
 
-Both mission scripts use `CMD_GOTO`. The current firmware commands yaw toward
-the next waypoint together with its position, so the intended travel is
-nose-first along each leg. It does not wait for heading alignment before
-moving; sideways or backward motion can occur during turns. Emergency collision
-avoidance can also move away from an obstacle while maintaining heading.
+```csv
+tag_id,local_x_m,local_y_m,local_z_m
+5,1.2,0.7,
+```
+
+Coordinates are estimated positions in the UAV's local NED frame, in metres.
+Z is normally blank unless `--assumed-altitude` is supplied. Observations without
+a valid local XY estimate are excluded from CSV. Repeated confirmed sightings
+remain separate rows. Mission events, timestamps,
+relative poses, image coordinates, and quality fields are omitted from CSV.
+JSONL retains those details and mission events in the original nested format.
+
+Both mission scripts use `CMD_GOTO`. With the updated ESP32 firmware, waypoint
+commands preserve heading instead of turning toward the next point, including
+on arrival and return. PX4 uses pitch/roll and thrust to move forward, backward,
+or sideways as needed while stabilizing yaw. The lawnmower route can therefore
+reverse travel direction without turning the nose. The camera stays pointed in
+the same direction, which must be considered when choosing search coverage.
+
+This behavior is implemented in `main/nav_task.c`, not a Python CLI option.
+Rebuild and flash the updated ESP32 firmware for the selected drone ID before
+expecting heading hold; running the scripts against older firmware still turns
+toward waypoints. Takeoff, landing, and RC takeover behavior are unchanged.
+Timed trajectories already hold the heading captured when playback starts.
+Heading hold is a command policy, not a guarantee of zero physical yaw motion.
 
 The transform is `tag_local_xy = uav_local_xy + Rz(heading) * tag_body_xyz`,
 using the mount transform from `apriltag_host.py`. **Roll and pitch are assumed
@@ -181,14 +196,38 @@ zero** because the UDP telemetry contains only XY and yaw. The latest telemetry
 received before the image is used, not the UAV position after detection
 finishes; matches older than `--pose-max-age` (0.5 s) are rejected. These are
 receipt timestamps, not synchronized exposure timestamps, so transport delay
-and attitude changes introduce error. Missing/invalid poses still produce an
-ID record with a localization status and null local position.
+and attitude changes introduce error. Missing/invalid poses produce a rejected
+diagnostic record in JSONL, but no CSV row.
 
-Observations rejected by the detector's quality gate are also retained with
-`quality_accepted: false` and a `quality_rejection_reason`; they may be false
-positives and are not assigned local positions. Repeated sightings are recorded
-individually rather than deduplicated by ID. These records cover decoded tags
-in processed frames, not tags the detector cannot decode or frames lost in transit.
+Both mission scripts now apply stricter acceptance than the raw detector in
+`tag_stream.py`. A saved detection must have zero corrected bits (`hamming=0`),
+decision margin above 80, a valid pose in front of the camera, and a valid local
+XY estimate. The same ID must pass these checks in three consecutive processed
+frames, with local XY within 0.5 m of its first sighting. Missing/rejected
+sightings, a camera restart, or a frame gap over 1.5 s reset confirmation.
+Duplicate frames cannot confirm a tag; multiple observations of the same ID
+in one frame are treated as ambiguous. These defaults reduce false IDs but
+can reject real tags seen briefly or with noisy position estimates. They are
+not a guarantee against a consistently misdecoded pattern.
+
+Use `--tag-min-margin 95` or `--tag-confirm-frames 4` for stricter acceptance.
+Margin is a decoder score, not a confidence percentage. If the tag IDs used
+in your search area are known, supply an allowlist, for example `--tag-ids 0 5 12`;
+otherwise all supported IDs (0–21) are considered. Both scripts accept these
+options. Example (replace the bounds and IDs with your assigned setup):
+
+```bash
+python simple_exploration_mission.py --drone-id 15 --bounds 0 2 -1 1 \
+    --tag-ids 0 5 12 --log confirmed_tags.csv --confirm
+```
+
+JSONL preserves every decoded observation as `detection`, `detection_candidate`,
+or `detection_rejected`, with `mission_accepted`, `acceptance_reason`, and
+`confirmation_count`. The original `quality_accepted` field describes the
+weaker firmware quality gate, not final mission acceptance. CSV includes only
+`detection` events. Repeated confirmed sightings are recorded individually.
+These changes apply to laptop mission recording immediately; they do not change
+the ESP32 detector or the raw observations displayed by `tag_stream.py`.
 
 Local tag Z is null by default because altitude is not transmitted. Optional
 `--assumed-altitude 0.5` estimates Z as `body_down - 0.5` during exploration and

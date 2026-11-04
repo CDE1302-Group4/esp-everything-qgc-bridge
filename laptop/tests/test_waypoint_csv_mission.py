@@ -110,19 +110,21 @@ def test_csv_flight_order_return_home_and_logging(fake_flight):
     comms.stop.assert_called_once()
 
 
-def test_mission_can_write_csv_output(fake_flight):
-    args, _, _, log_path, _, _ = fake_flight
+def test_mission_can_write_csv_output(fake_flight, monkeypatch):
+    args, _, recorder, log_path, _, _ = fake_flight
+
+    def create_recorder(ip, port, tracker, journal, **kwargs):
+        recorder.start.side_effect = lambda timeout: journal.write(
+            "detection", tag_id=5, local_position_ned_m=(1, 2, None))
+        return recorder
+
+    monkeypatch.setattr(runner, "TagRecorder", create_recorder)
     csv_path = log_path.with_suffix(".csv")
     args[args.index("--log") + 1] = str(csv_path)
     assert waypoint.main(args) == 0
     with csv_path.open(newline="") as source:
         records = list(csv.DictReader(source))
-    assert records[0]["type"] == "mission"
-    assert json.loads(records[0]["details_json"])["waypoints_m"] == [[0.5, 0], [1, 1]]
-    goals = [r for r in records if r["type"] == "goal"]
-    assert float(goals[-1]["goal_local_x_m"]) == 2
-    assert float(goals[-1]["goal_local_y_m"]) == 3
-    assert records[-1]["type"] == "landing_command_sent"
+    assert records == [{"tag_id": "5", "local_x_m": "1", "local_y_m": "2", "local_z_m": ""}]
     assert not log_path.exists()
 
 
