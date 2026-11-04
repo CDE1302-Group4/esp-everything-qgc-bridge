@@ -94,3 +94,200 @@ No reboot needed. Wait for `Waiting for CMD_START from laptop...` and run again.
 - Commands are not acknowledged: check `wifi: CMD_...` in the serial monitor.
 - A START sent too early is ignored. The script can't tell, so check the serial monitor.
 - `tag_id` / `tag_dist_m` in telemetry are info only, latched until the ESP32 reboots.
+
+## AprilTag exploration mission
+
+`simple_exploration_mission.py` extends the flight sequence in
+`simple_waypoint_mission.py` (the repository's waypoint base). It takes off,
+flies a lawnmower search, records live AprilTag observations, retraces reached
+waypoints to the recorded starting position, and requests landing there.
+The camera/detector runs in a separate thread throughout the mission, including
+takeoff and return. No prior target-tag locations are needed.
+
+Run these commands from the **laptop directory**, using the project environment:
+
+```bash
+conda activate cde1302-laptop
+
+# Review a small example search without connecting or sending commands.
+python simple_exploration_mission.py --drone-id 22 \
+    --bounds 0 2 -1 1 --lane-spacing 0.5 --dry-run
+
+# Place the UAV at its assigned start, then initiate from the laptop.
+python simple_exploration_mission.py --drone-id 22 \
+    --bounds 0 2 -1 1 --lane-spacing 0.5 \
+    --arrival-timeout 60 --max-search-time 300 \
+    --log exploration_22.csv --confirm
+```
+
+Replace the example bounds with the assigned search area. `--bounds` is
+`XMIN XMAX YMIN YMAX` in metres **relative to the recorded start**, along
+local NED X/Y (north/east), not forward/right relative to the UAV. The script
+clears the firmware's arena offset, so telemetry and commands use PX4 local
+coordinates; it does not load `setup.yaml`. It records the actual pre-takeoff
+XY and adds that position to the planned offsets, including after a previous
+flight where the starting XY is no longer zero. Physically place the vehicle
+at the assigned starting position before invoking it.
+
+Search rows run along X, with Y spacing no greater than `--lane-spacing`.
+Choose spacing and bounds for the camera's effective tag footprint at flight
+height; the default is not a guarantee of visual coverage. The camera points
+forward and 45 degrees down. Allow clearance for the vehicle and turns:
+the rectangle constrains planned goals, not the complete obstacle-avoidance
+flight path. The transit from the start to the rectangle must also be clear.
+There is a one-second detection dwell at each goal (`--dwell`). The mission
+finishes after visiting all goals, even if it detects no tags.
+
+Close other flight controllers and camera viewers before running: this process
+owns telemetry UDP 5005 and camera UDP 5009, and learns the ESP IP from the
+selected drone's telemetry. It requires a decoded camera frame before START.
+The host detector uses the existing in-tree C sources and needs a C compiler
+on first run, just like `tag_stream.py`. The existing family detects IDs 0–21;
+tag size, camera intrinsics, and camera mount must match `apriltag_host.py`
+(currently a 0.12 m tag and 320×240 image calibration).
+
+Exploration records default to a timestamped `exploration_*.csv` in the working
+directory. `--log name.csv` selects CSV, and `--log name.jsonl` selects JSONL.
+Records are appended to a new file and flushed after each record; an existing
+file is never overwritten. Every decoded detection in a
+processed frame includes:
+
+- Tag ID/family, quality metrics and acceptance/rejection reason, frame ID,
+  camera boot nonce, and mission phase.
+- Image centre/corners in pixels and camera-to-tag range when a valid pose exists.
+- UTC record time, UTC/monotonic image receipt time, and camera processing age.
+- Camera-relative and body-relative translations in metres and rotations as
+  nine-element row-major matrices (tag axes expressed in the named frame).
+- Estimated tag position and orientation in local NED, UAV XY/heading, and
+  the telemetry/image receipt-time difference used for localization.
+
+CSV has one header and one row per event or detection. Filter the `type` column
+to `detection` to see tag observations. Positions use separate columns such as
+`local_x_m`, `local_y_m`, `local_z_m`, `body_forward_m`, and `camera_range_m`.
+Unknown values are blank, and rotations are split into `camera_r00` through
+`camera_r22` (and corresponding `body_`/`local_` columns). Extra mission metadata,
+including the full planned waypoint list, is preserved in `details_json`.
+JSONL retains the original nested record format.
+
+Both mission scripts use `CMD_GOTO`. The current firmware commands yaw toward
+the next waypoint together with its position, so the intended travel is
+nose-first along each leg. It does not wait for heading alignment before
+moving; sideways or backward motion can occur during turns. Emergency collision
+avoidance can also move away from an obstacle while maintaining heading.
+
+The transform is `tag_local_xy = uav_local_xy + Rz(heading) * tag_body_xyz`,
+using the mount transform from `apriltag_host.py`. **Roll and pitch are assumed
+zero** because the UDP telemetry contains only XY and yaw. The latest telemetry
+received before the image is used, not the UAV position after detection
+finishes; matches older than `--pose-max-age` (0.5 s) are rejected. These are
+receipt timestamps, not synchronized exposure timestamps, so transport delay
+and attitude changes introduce error. Missing/invalid poses still produce an
+ID record with a localization status and null local position.
+
+Observations rejected by the detector's quality gate are also retained with
+`quality_accepted: false` and a `quality_rejection_reason`; they may be false
+positives and are not assigned local positions. Repeated sightings are recorded
+individually rather than deduplicated by ID. These records cover decoded tags
+in processed frames, not tags the detector cannot decode or frames lost in transit.
+
+Local tag Z is null by default because altitude is not transmitted. Optional
+`--assumed-altitude 0.5` estimates Z as `body_down - 0.5` during exploration and
+return only, explicitly marked as an assumption. It **does not command flight
+altitude**. START/GOTO use the firmware's cruise altitude (currently 0.5 m).
+Measured full 3D localization would require timestamped XYZ and full attitude
+telemetry from the firmware.
+
+`--max-search-time` limits exploration only; budget additional time/battery for
+retracing the route and landing. A search waypoint timeout or exhausted search
+budget stops further searching and returns via reached goals, with exit status
+1 for incomplete exploration. A return timeout, camera/detector/logging failure,
+stale telemetry, or Ctrl+C requests LAND in place. LAND is repeated three times.
+Successful search and return with LAND sent exits 0; Ctrl+C exits 130.
+
+As with the base waypoint script, START/LAND are not acknowledged, and telemetry
+has no altitude, armed status, or landed status. The takeoff wait is configurable
+(`--takeoff-wait`, default 12 s); confirm takeoff and final touchdown/disarm in
+QGC and the ESP serial monitor. Exit 0 means the route completed and LAND was
+sent, not that touchdown was verified. Detection does not cause landing on a tag.
+
+Hardware-free validation:
+
+```bash
+python -m pytest -q tests/test_exploration_mission.py
+```
+
+## CSV waypoint mission with AprilTag logging
+
+`simple_waypoint_mission.py` now uses the same camera recorder and mission
+lifecycle as `simple_exploration_mission.py`. Supply the route yourself instead
+of generating it with `lawnmower()`. The default sequence is START → CSV points
+in file order → reached points in reverse order → recorded start → LAND.
+
+From the **laptop directory**:
+
+```bash
+conda activate cde1302-laptop
+
+# Validate the included example and print its points without connecting.
+python simple_waypoint_mission.py --drone-id 22 \
+    --waypoints-csv waypoints_example.csv --dry-run
+
+# Fly after placing the UAV at the assigned start.
+python simple_waypoint_mission.py --drone-id 22 \
+    --waypoints-csv waypoints_example.csv --log waypoints_22.jsonl --confirm
+```
+
+CSV format (metres):
+
+```csv
+x,y
+0.5,0.0
+0.5,0.5
+0.0,0.5
+```
+
+The `x,y` header is optional. Blank lines and whole lines beginning with `#`
+are allowed. All rows are validated before connecting: empty routes,
+malformed rows, missing coordinates, and non-finite values are rejected.
+Points are neither reordered nor resampled. This is a horizontal waypoint
+mission using `CMD_GOTO`, not a timed trajectory upload. The `t,x,y,z` CSVs
+used by `send_trajectory.py` are rejected rather than ignoring time/altitude.
+Flight altitude is set by the firmware (currently 0.5 m).
+
+By default, all points are offsets from the actual recorded starting XY along
+local NED north/east. A point `0,0` means that starting position, and all points
+use the same origin; they are not incremental offsets from the previous point.
+With `--map-frame --config setup.yaml`, points instead specify absolute arena
+coordinates. That mode requires the selected drone's start offset in the
+configuration. Return still targets the actual position recorded before START.
+Tag localization subtracts the configured arena offset so detection records
+remain in the UAV's **local** frame in either mode.
+
+The existing `--waypoint x,y` and `--waypoints-file` options remain supported.
+A `.csv` passed through `--waypoints-file` uses the CSV reader; other files
+retain the legacy `x,y` / `x y` line format. If inline points and a file are
+both supplied, inline points are flown first, then file points.
+
+The camera must be working before START; close separate camera viewers first.
+Detection, timestamps, local-pose assumptions, and logging follow the
+exploration mission described above. Use `--assumed-altitude` only to supply
+an assumed cruise altitude for tag Z estimation, not to change flight height.
+Waypoint missions retain a timestamped JSONL filename by default; use
+`--log waypoints_22.csv` to select the same CSV output as exploration missions.
+
+Defaults are a 12 s takeoff wait, a 60 s timeout per waypoint, a 0.25 m arrival
+radius, and a 1 s dwell. `--max-search-time` defaults to 300 s for the outbound
+route; return and landing require additional time. A missed waypoint or expired
+budget ends the outbound route and returns through reached points. Connection,
+camera, or return failures and Ctrl+C after START request landing in place.
+The existing telemetry cannot confirm takeoff or touchdown.
+
+The former script landed at the last supplied point and continued past missed
+points. Its default now returns to the recorded start and stops the outbound
+route at the first missed point. Explicit `--finish-action hold` also returns
+to the start, then requests HOLD and exits, stopping camera/telemetry handling;
+the user is responsible for subsequent landing.
+
+```bash
+python -m pytest -q tests/test_waypoint_csv_mission.py tests/test_exploration_mission.py
+```

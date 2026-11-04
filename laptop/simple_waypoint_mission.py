@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple GCS mission: arm/takeoff -> fly through waypoints -> land.
+GCS mission: take off -> visit CSV waypoints and log tags -> return -> land.
 
 Custom UDP commands (see protocol.py):
   - CMD_START : arm + take off to the firmware's cruise altitude
@@ -15,7 +15,16 @@ Example:
         --waypoint 0.5,0.0 --waypoint=-0.5,0.5
 
     python3 laptop/simple_waypoint_mission.py --drone-id 22 --confirm \
-        --waypoints-file waypoints/waypoints_example.txt
+        --waypoints-csv laptop/waypoints_example.csv
+
+CSV columns: x,y (metres), with an optional x,y header and # comment lines.
+Points are flown in file order using CMD_GOTO, not timed trajectory playback.
+Time/altitude columns from send_trajectory.py are not supported by CMD_GOTO.
+Camera detection uses mission_tags.py, the same detector as tag_stream.py.
+Every decoded tag in each processed image is saved to --log, including its ID,
+timestamps, image coordinates, relative pose/range, and available local position.
+Low-quality observations are recorded with a rejection reason, not localized.
+Repeated sightings are retained. Recording is automatic; no extra flag is needed.
 
 Exit code: 0 all waypoints reached, 1 error or waypoint timeout, 130 Ctrl+C.
 """
@@ -23,9 +32,10 @@ Exit code: 0 all waypoints reached, 1 error or waypoint timeout, 130 Ctrl+C.
 from __future__ import annotations
 
 import argparse
+import csv
+from datetime import datetime, timezone
 import logging
 import math
-import signal
 import sys
 import threading
 import time
@@ -133,11 +143,44 @@ def parse_waypoint(value: str) -> tuple[float, float]:
             "Waypoint coordinates must be numeric."
         ) from exc
 
+    if not all(math.isfinite(v) for v in (x_value, y_value)):
+        raise argparse.ArgumentTypeError("Waypoint coordinates must be finite.")
+
     return x_value, y_value
+
+
+def load_waypoints_from_csv(path: str) -> list[tuple[float, float]]:
+    """Read strict x,y CSV without silently dropping malformed flight goals."""
+    file_path = Path(path).expanduser()
+    waypoints = []
+    first_row = True
+    with file_path.open(encoding="utf-8-sig", newline="") as source:
+        for line_number, raw_line in enumerate(source, 1):
+            if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+                continue
+            try:
+                row = [field.strip() for field in next(csv.reader([raw_line], strict=True))]
+                if first_row and [field.lower() for field in row] == ["x", "y"]:
+                    first_row = False
+                    continue
+                first_row = False
+                if len(row) != 2:
+                    raise ValueError("expected exactly x,y; t/z columns require send_trajectory.py")
+                point = (float(row[0]), float(row[1]))
+                if not all(math.isfinite(v) for v in point):
+                    raise ValueError("coordinates must be finite")
+            except (ValueError, csv.Error) as exc:
+                raise ValueError(f"{file_path}:{line_number}: invalid waypoint: {exc}") from exc
+            waypoints.append(point)
+    if not waypoints:
+        raise ValueError(f"{file_path}: no waypoint rows found")
+    return waypoints
 
 
 def load_waypoints_from_file(path: str) -> list[tuple[float, float]]:
     file_path = Path(path).expanduser()
+    if file_path.suffix.lower() == ".csv":
+        return load_waypoints_from_csv(path)
     if not file_path.exists():
         raise FileNotFoundError(f"Waypoint file not found: {file_path}")
 
@@ -164,6 +207,8 @@ def load_waypoints_from_file(path: str) -> list[tuple[float, float]]:
                     f"Invalid waypoint coordinates on line {line_number}: {raw_line}"
                 ) from exc
 
+        if not all(math.isfinite(v) for v in waypoint):
+            raise ValueError(f"Non-finite waypoint coordinates on line {line_number}")
         waypoints.append(waypoint)
 
     return waypoints
@@ -177,9 +222,9 @@ def join_waypoint_values(argv: list[str]) -> list[str]:
     return out
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Send a simple takeoff -> waypoint -> land mission from the laptop GCS"
+        description="Take off, visit CSV waypoints with AprilTag logging, return to start, and land."
     )
     parser.add_argument(
         "--drone-id",
@@ -218,21 +263,23 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Waypoint as x,y. Repeat this option for multiple waypoints.",
     )
-    parser.add_argument(
+    files = parser.add_mutually_exclusive_group()
+    files.add_argument("--waypoints-csv", help="CSV file with x,y columns, in flight order.")
+    files.add_argument(
         "--waypoints-file",
-        help="Text file containing waypoints, one x,y entry per line (blank lines and # comments are allowed).",
+        help="Waypoint file: .csv uses the CSV reader; other files accept x,y or x y lines.",
     )
     parser.add_argument(
         "--takeoff-wait",
         type=float,
-        default=10.0,
+        default=12.0,
         help="Seconds to wait after CMD_START before sending the first waypoint.",
     )
     parser.add_argument(
         "--arrival-timeout",
         type=float,
-        default=25.0,
-        help="Seconds to wait for each waypoint to be reached before continuing.",
+        default=60.0,
+        help="Seconds allowed for each waypoint; a timeout ends the search and starts return.",
     )
     parser.add_argument(
         "--arrival-radius",
@@ -256,7 +303,7 @@ def parse_args() -> argparse.Namespace:
         "--finish-action",
         choices=["hold", "land"],
         default="land",
-        help="Action after final waypoint: hold current altitude/position or land (default: land).",
+        help="Action after returning to the start: hold or land (default: land).",
     )
     parser.add_argument(
         "--confirm",
@@ -268,7 +315,42 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print each incoming telemetry update from the drone.",
     )
-    return parser.parse_args(join_waypoint_values(sys.argv[1:]))
+    parser.add_argument("--dwell", type=float, default=1.0,
+                        help="Detection dwell at each reached outbound waypoint (s).")
+    parser.add_argument("--max-search-time", type=float, default=300.0,
+                        help="Outbound waypoint budget (s); return and landing are additional.")
+    parser.add_argument("--camera-timeout", type=float, default=3.0)
+    parser.add_argument("--pose-max-age", type=float, default=0.5)
+    parser.add_argument("--assumed-altitude", type=float,
+                        help="Assumed cruise height above local NED Z=0 for tag localization only.")
+    parser.add_argument("--fps", type=int, default=5)
+    parser.add_argument("--quality", type=int, default=60)
+    parser.add_argument("--log", type=Path,
+                        default=Path("waypoints_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ") + ".jsonl"),
+                        help="Mission/tag log: .csv for spreadsheet columns, .jsonl for JSON lines. "
+                             "Default: timestamped waypoints_*.jsonl in the working directory.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Validate and print the waypoints without opening sockets or flying.")
+    args = parser.parse_args(join_waypoint_values(sys.argv[1:] if argv is None else argv))
+    positive = (args.arrival_timeout, args.arrival_radius, args.connect_timeout,
+                args.stale_timeout, args.camera_timeout, args.pose_max_age, args.max_search_time)
+    if not all(math.isfinite(v) and v > 0 for v in positive):
+        parser.error("Timeouts and arrival radius must be finite and positive.")
+    if not all(math.isfinite(v) and v >= 0 for v in (args.takeoff_wait, args.dwell)):
+        parser.error("Takeoff wait and dwell must be finite and non-negative.")
+    if args.assumed_altitude is not None and (
+            not math.isfinite(args.assumed_altitude) or args.assumed_altitude <= 0):
+        parser.error("Assumed altitude must be finite and positive.")
+    if not 0 <= args.drone_id <= 255:
+        parser.error("Drone ID must be 0-255.")
+    if not all(1 <= port <= 65535 for port in (args.telem_port, args.cmd_port)):
+        parser.error("UDP ports must be 1-65535.")
+    from protocol import build_camera_stream_command
+    try:
+        build_camera_stream_command(True, args.fps, args.quality)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
 def send_command(comms: CommsNode, drone_id: int, command_type: int, name: str,
@@ -294,17 +376,20 @@ def wait_for_arrival(
     goal_x: float,
     goal_y: float,
     arrival_radius_m: float,
+    check_health=None,
 ) -> bool:
     start = last_sent = time.monotonic()
     deadline = start + timeout_s
     saw_moving = False           # drone reported ROTATING/FLYING/STUCK
 
     while time.monotonic() < deadline:
+        if check_health is not None:
+            check_health()
         now = time.monotonic()
         snapshot = tracker.latest()
         packet = snapshot.packet
         age = now - snapshot.received_at
-        if age > stale_timeout_s:
+        if packet is None or age > stale_timeout_s:
             raise ConnectionError(f"Telemetry is stale ({age:.1f} s).")
 
         if snapshot.received_at > start:
@@ -353,124 +438,26 @@ def wait_for_arrival(
     return False
 
 
-def main() -> int:
-    args = parse_args()
-
-    if (
-        args.takeoff_wait < 0.0
-        or args.arrival_timeout <= 0.0
-        or args.arrival_radius <= 0.0
-    ):
-        raise SystemExit(
-            "Invalid timing values. Use non-negative takeoff wait, positive arrival timeout, and positive arrival radius."
-        )
-
-    waypoints = list(args.waypoints)
-    if args.waypoints_file:
-        waypoints.extend(load_waypoints_from_file(args.waypoints_file))
-
-    if not waypoints:
-        raise SystemExit("No waypoints supplied. Use --waypoint values or --waypoints-file.")
-
-    config_path: Optional[str] = args.config if args.map_frame else None
-    if config_path and not Path(config_path).exists():
-        raise SystemExit(f"--map-frame needs {config_path}, which was not found.")
-
-    tracker = TelemetryTracker(args.drone_id, print_live=args.live_telem)
-    comms = CommsNode(
-        listen_port=args.telem_port,
-        cmd_port=args.cmd_port,
-        config_path=config_path,
-    )
-    if config_path is None:
-        # Start offset (0, 0) so waypoints are relative to takeoff; this also
-        # clears any offset a previous setup.yaml run left on the drone.
-        comms.set_nav_tags([], {})
-        log.info("Waypoints are relative to the takeoff point (start offset 0, 0).")
-    else:
-        log.info("Waypoints are in the arena frame (start offset from %s).", config_path)
-    comms.on_telemetry(tracker.callback)
-
-    def handle_interrupt(signum: int, frame: object) -> None:
-        raise KeyboardInterrupt
-
-    signal.signal(signal.SIGINT, handle_interrupt)
-
-    start_sent = land_sent = aborted = False
-    comms.start()
+def main(argv=None) -> int:
+    args = parse_args(argv)
     try:
-        log.info("Waiting for telemetry from drone %d...", args.drone_id)
-        tracker.wait_for_first_packet(args.connect_timeout, args.telem_port, comms.known_drones)
-        log.info("Telemetry link established.")
-
-        if args.confirm:
-            confirmation = input(
-                f"Type MISSION-{args.drone_id} to start the mission: "
-            ).strip()
-            if confirmation != f"MISSION-{args.drone_id}":
-                log.info("Confirmation did not match. Mission cancelled.")
-                return 0
-
-        log.info("Sending CMD_START (arm + takeoff)")
-        send_command(comms, args.drone_id, CMD_START, "CMD_START")
-        start_sent = True
-        if args.takeoff_wait > 0.0:
-            time.sleep(args.takeoff_wait)
-
-        missed = 0
-        for index, (goal_x, goal_y) in enumerate(waypoints, start=1):
-            log.info(
-                "Sending waypoint %d/%d to (%.2f, %.2f)",
-                index,
-                len(waypoints),
-                goal_x,
-                goal_y,
-            )
-
-            def resend(gx: float = goal_x, gy: float = goal_y) -> None:
-                send_goto(comms, args.drone_id, gx, gy)
-
-            resend()
-            if not wait_for_arrival(
-                tracker,
-                resend,
-                timeout_s=args.arrival_timeout,
-                stale_timeout_s=args.stale_timeout,
-                goal_x=goal_x,
-                goal_y=goal_y,
-                arrival_radius_m=args.arrival_radius,
-            ):
-                missed += 1
-                send_command(comms, args.drone_id, CMD_HOLD, "CMD_HOLD")   # stop before next leg
-            time.sleep(0.5)
-
-        if args.finish_action == "land":
-            log.info("Sending CMD_LAND")
-            send_command(comms, args.drone_id, CMD_LAND, "CMD_LAND", repeat=3)
-            land_sent = True
-        else:
-            log.info("Sending CMD_HOLD")
-            send_command(comms, args.drone_id, CMD_HOLD, "CMD_HOLD")
-
-        if missed:
-            log.warning("%d of %d waypoints not reached.", missed, len(waypoints))
-            return 1
-        return 0
-    except KeyboardInterrupt:
-        aborted = True
-        log.warning("Mission interrupted.")
-        return 130
-    except Exception as exc:
-        aborted = True
-        log.error("Mission aborted: %s", exc)
+        waypoints = list(args.waypoints)
+        if args.waypoints_csv:
+            waypoints.extend(load_waypoints_from_csv(args.waypoints_csv))
+        if args.waypoints_file:
+            waypoints.extend(load_waypoints_from_file(args.waypoints_file))
+        if not waypoints:
+            raise ValueError("No waypoints supplied. Use --waypoints-csv, --waypoint, or --waypoints-file.")
+    except (OSError, ValueError, argparse.ArgumentTypeError) as exc:
+        log.error("Invalid waypoint input: %s", exc)
         return 1
-    finally:
-        if aborted and start_sent and not land_sent:
-            try:
-                send_command(comms, args.drone_id, CMD_LAND, "fallback CMD_LAND", repeat=3)
-            except Exception as exc:
-                log.error("Could not send fallback LAND: %s", exc)
-        comms.stop()
+
+    # Import after defining the base helpers: the exploration runner and tag
+    # tracker reuse them. Both entry points share the same flight lifecycle.
+    from simple_exploration_mission import run_waypoint_mission
+    return run_waypoint_mission(args, waypoints, metadata={
+        "route_source": args.waypoints_csv or args.waypoints_file or "command_line",
+    })
 
 
 if __name__ == "__main__":
