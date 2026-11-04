@@ -9,6 +9,8 @@ Custom UDP commands (see protocol.py):
 
 Waypoints are relative to the takeoff point unless --map-frame is given,
 in which case they are arena coordinates and setup.yaml's start offset is sent.
+With the updated nav_task firmware, waypoints preserve heading and translate
+using pitch/roll. Rebuild/reflash the ESP32 to apply that firmware behavior.
 
 Example:
     python3 laptop/simple_waypoint_mission.py --drone-id 22 --confirm \
@@ -21,9 +23,10 @@ CSV columns: x,y (metres), with an optional x,y header and # comment lines.
 Points are flown in file order using CMD_GOTO, not timed trajectory playback.
 Time/altitude columns from send_trajectory.py are not supported by CMD_GOTO.
 Camera detection uses mission_tags.py, the same detector as tag_stream.py.
-Every decoded tag in each processed image is saved to --log, including its ID,
-timestamps, image coordinates, relative pose/range, and available local position.
-Low-quality observations are recorded with a rejection reason, not localized.
+Confirmed tags are saved to --log. CSV saves only
+tag_id and local X/Y/Z coordinates; JSONL retains timestamps, image coordinates,
+relative poses/ranges, quality details, and mission events. Rejected and
+unconfirmed observations are separate diagnostic events in JSONL only.
 Repeated sightings are retained. Recording is automatic; no extra flag is needed.
 
 Exit code: 0 all waypoints reached, 1 error or waypoint timeout, 130 Ctrl+C.
@@ -44,6 +47,7 @@ from pathlib import Path
 from typing import Optional
 
 from comms import CommsNode
+from tag_acceptance import add_tag_arguments, validate_tag_arguments
 from protocol import (
     CMD_GOTO,
     CMD_HOLD,
@@ -325,9 +329,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Assumed cruise height above local NED Z=0 for tag localization only.")
     parser.add_argument("--fps", type=int, default=5)
     parser.add_argument("--quality", type=int, default=60)
+    add_tag_arguments(parser)
     parser.add_argument("--log", type=Path,
                         default=Path("waypoints_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ") + ".jsonl"),
-                        help="Mission/tag log: .csv for spreadsheet columns, .jsonl for JSON lines. "
+                        help="Tag log: .csv for tag ID and local X/Y/Z only; .jsonl for detailed records. "
                              "Default: timestamped waypoints_*.jsonl in the working directory.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate and print the waypoints without opening sockets or flying.")
@@ -347,6 +352,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("UDP ports must be 1-65535.")
     from protocol import build_camera_stream_command
     try:
+        validate_tag_arguments(args)
         build_camera_stream_command(True, args.fps, args.quality)
     except ValueError as exc:
         parser.error(str(exc))

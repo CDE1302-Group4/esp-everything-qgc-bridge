@@ -4,6 +4,8 @@
 Built on simple_waypoint_mission.py. Bounds are metres relative to the
 recorded starting position, along local NED X/Y (not body forward/right).
 Place the UAV at its assigned start before running. See TEST_GUIDE.md.
+Updated nav_task firmware holds heading during the sweep and return; the UAV
+can move backward or sideways without turning. This requires an ESP32 reflash.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from comms import CommsNode
 from mission_tags import Journal, PoseTracker, TagRecorder
 from protocol import CMD_HOLD, CMD_LAND, CMD_START
 from simple_waypoint_mission import send_command, send_goto, wait_for_arrival
+from tag_acceptance import add_tag_arguments, validate_tag_arguments
 
 log = logging.getLogger("simple_exploration_mission")
 
@@ -70,11 +73,12 @@ def parse_args(argv=None):
                              "Does not set flight altitude; absent means local Z is null.")
     parser.add_argument("--fps", type=int, default=5)
     parser.add_argument("--quality", type=int, default=60)
+    add_tag_arguments(parser)
     parser.add_argument("--telem-port", type=int, default=5005)
     parser.add_argument("--cmd-port", type=int, default=5006)
     parser.add_argument("--log", type=Path,
                         default=Path("exploration_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ") + ".csv"),
-                        help="Mission/tag log: .csv for spreadsheet columns (default), .jsonl for JSON lines.")
+                        help="Tag log: .csv for tag ID and local X/Y/Z only (default); .jsonl for detailed records.")
     parser.add_argument("--confirm", action="store_true",
                         help="Require typing MISSION-<id> before starting flight.")
     parser.add_argument("--dry-run", action="store_true",
@@ -82,6 +86,7 @@ def parse_args(argv=None):
     parser.add_argument("--live-telem", action="store_true")
     args = parser.parse_args(argv)
     try:
+        validate_tag_arguments(args)
         lawnmower(args.bounds, args.lane_spacing)
         positive = (args.takeoff_wait, args.arrival_timeout, args.arrival_radius,
                     args.max_search_time, args.connect_timeout, args.stale_timeout,
@@ -247,11 +252,13 @@ def run_waypoint_mission(args, waypoints, metadata=None):
     comms.on_telemetry(tracker.callback)
     try:
         journal = Journal(args.log)
-        log.info("Recording mission events and AprilTag observations to %s", Path(args.log).resolve())
+        log.info("Recording AprilTag observations to %s", Path(args.log).resolve())
         journal.write("mission", drone_id=args.drone_id, waypoints_m=waypoints,
                       waypoint_frame=waypoint_frame, map_offset_m=map_offset,
                       frame="PX4 local NED for detections",
-                      detection_policy="all decoded tags; quality-rejected observations are not localized",
+                      detection_policy="exact decode, valid local pose, consistent consecutive frames",
+                      tag_min_margin=args.tag_min_margin, tag_confirm_frames=args.tag_confirm_frames,
+                      tag_ids=args.tag_ids,
                       timestamp_basis="laptop receipt; no synchronized capture clock",
                       attitude_assumption="roll=pitch=0", assumed_cruise_altitude_m=args.assumed_altitude,
                       **(metadata or {}))
@@ -259,7 +266,9 @@ def run_waypoint_mission(args, waypoints, metadata=None):
         tracker.wait_for_first_packet(args.connect_timeout, args.telem_port, comms.known_drones)
         recorder = TagRecorder(tracker.latest().source_ip, args.cmd_port, tracker, journal,
                                fps=args.fps, quality=args.quality, pose_max_age=args.pose_max_age,
-                               camera_timeout=args.camera_timeout, assumed_altitude=args.assumed_altitude)
+                               camera_timeout=args.camera_timeout, assumed_altitude=args.assumed_altitude,
+                               tag_min_margin=args.tag_min_margin, tag_confirm_frames=args.tag_confirm_frames,
+                               tag_ids=args.tag_ids)
         mission = Mission(args, comms, tracker, recorder, journal)
         # Give the configured frame offset time to apply before capturing home.
         for _ in range(3):
