@@ -25,6 +25,7 @@ PKT_AT_DEBUG  = 0x04   # live AprilTag detections (debug stream)
 
 AT_DEBUG_PORT = 5008   # UDP port the AprilTag debug stream arrives on
 CAMERA_STREAM_PORT = 5009
+TELEM_MIRROR_PORT = 5010  # laptop-only: original IPv4 (4 bytes) + telemetry
 
 CMD_GOTO          = 0x01   # navigate to (goal_x, goal_y)
 CMD_LAND          = 0x02   # land immediately

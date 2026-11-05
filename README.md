@@ -110,6 +110,30 @@ After `laptop/requirements.txt` changes, update the environment with
 `conda env update -f laptop/environment.yml`. The laptop tests run with
 `cd laptop && python -m pytest tests`.
 
+`tag_stream.py` opens two spatial plots. The left shows currently visible tags
+relative to the drone, with IDs, straight-line distances and down coordinates.
+The right keeps a permanent top-view map with the drone's starting position at
+`(0, 0)`, its travelled path and every mapped tag ID. Both axes are metres:
+right and forward relative to the starting heading. Tags remain when out of
+view; repeat sightings refine their positions by averaging. Map labels show
+horizontal distance from the start; live-view distances are 3D from the drone.
+
+Start the viewer before the drone moves. The map anchors to the first valid
+telemetry position and heading, then combines drone motion with tag poses.
+`send_trajectory.py` and other `CommsNode` programs automatically mirror
+telemetry locally on UDP 5010, so they can run alongside the viewer without
+sharing the flight program's receive port. For a standalone viewer receiving
+direct drone telemetry, add `--telem-port 5005` (only when no other program is
+using that port, on the firmware's configured telemetry host). If telemetry is
+missing or too old for a camera frame, the existing map stays visible and new
+mapping pauses; the live left view continues. Mapping assumes the drone is
+level because the telemetry supplies position and yaw, without roll or pitch.
+
+The complete figure is saved on exit (q, Esc, Ctrl+C, or closing the plot) as
+`tag_stream_plot_<timestamp>.png` in the current directory. Use
+`--plot-output laptop/tags.png` to choose the destination. Press `s` in the
+camera window to save both the camera picture and current plot.
+
 ### C compiler
 
 `tag_stream.py` compiles the drone's AprilTag detector on its first run, so

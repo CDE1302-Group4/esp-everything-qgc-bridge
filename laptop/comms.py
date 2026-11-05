@@ -31,6 +31,7 @@ from protocol import (
     TelemetryPacket, CommandPacket, NavTag,
     parse_telemetry, build_command, build_nav_tags_command,
     build_peers_command, MAX_FOUND_TAGS,
+    TELEM_MIRROR_PORT,
 )
 
 log = logging.getLogger(__name__)
@@ -246,6 +247,17 @@ class CommsNode:
             pkt = parse_telemetry(data)
             if pkt is None:
                 continue
+
+            # Give the camera mapper a local copy without sharing the flight
+            # command program's UDP receive port. Preserve the drone's source IP.
+            try:
+                # Separate socket: Windows can deliver an ICMP port-unreachable
+                # as a later recv error when the optional viewer is closed.
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as mirror:
+                    mirror.sendto(socket.inet_aton(src_ip) + data,
+                                  ("127.0.0.1", TELEM_MIRROR_PORT))
+            except OSError:
+                pass  # the viewer is optional; flight telemetry must continue
 
             is_new_drone = False
             with self._lock:
