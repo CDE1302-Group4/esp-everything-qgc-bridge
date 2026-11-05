@@ -13,7 +13,9 @@ mirrored locally by send_trajectory.py or another CommsNode program; use
 --telem-port 5005 for direct telemetry when running the viewer alone.
 The figure is saved on exit to --plot-output (default:
 tag_stream_plot_<timestamp>.png in the current directory).
-Keys: q or Esc quit, s saves the camera picture and plot.
+With TF01 firmware, map offsets are removed and the flight path starts on arming.
+Preflight estimate drift is shown as text, not as a flown path.
+Keys: q or Esc quit, s saves the camera picture and plot, r resets the map.
 
 For tuning (rejected tags, the drone's own detections, HUD) use
 tag_stream_legacy.py.
@@ -57,6 +59,21 @@ class StartMap:
         self.drone_path = []
         self.tags = {}  # id -> averaged (forward, right), retained when unseen
         self.counts = {}
+        self.has_flight_status = False
+        self.armed = False
+        self.ground_pose = None
+        self.preflight_reference = None
+        self.preflight_delta = (0.0, 0.0)
+
+    def reset(self):
+        """Explicitly discard the map; never silently move an in-flight origin."""
+        self.origin = self.poses[-1][1] if self.poses else None
+        self.drone_path.clear()
+        self.tags.clear()
+        self.counts.clear()
+        self.preflight_reference = None
+        if self.has_flight_status and not self.armed:
+            self.origin = None
 
     def relative_position(self, x, y):
         x0, y0, heading0 = self.origin
@@ -65,11 +82,36 @@ class StartMap:
         return c * dx + s * dy, -s * dx + c * dy
 
     def update_pose(self, packet, elapsed_s):
-        pose = (packet.ned_x, packet.ned_y, packet.heading_rad)
+        extended = getattr(packet, "flight_status_version", None) == 1
+        ox, oy = (packet.map_offset_x, packet.map_offset_y) if extended else (0, 0)
+        pose = (packet.ned_x - ox, packet.ned_y - oy, packet.heading_rad)
         if not all(math.isfinite(v) for v in (*pose, elapsed_s)):
+            return
+        if extended and not packet.px4_link_ok:
             return
         if self.poses and elapsed_s < self.poses[-1][0]:
             return
+        if extended and not self.has_flight_status:
+            self.reset()
+            self.origin = None
+            self.poses.clear()
+        self.has_flight_status = extended
+        if extended:
+            was_armed = self.armed
+            self.armed = bool(packet.px4_armed)
+            if not self.armed:
+                self.ground_pose = pose
+                if was_armed:
+                    self.preflight_reference = None
+                if self.preflight_reference is None:
+                    self.preflight_reference = pose
+                self.preflight_delta = tuple(pose[i] - self.preflight_reference[i] for i in (0, 1))
+                self.poses.append((elapsed_s, pose))
+                return
+            if not was_armed:
+                self.reset()
+                self.origin = self.ground_pose or pose
+                self.poses.clear()
         if self.origin is None:
             self.origin = pose
         position = self.relative_position(*pose[:2])
@@ -82,7 +124,7 @@ class StartMap:
         return bool(self.poses and 0 <= elapsed_s - self.poses[-1][0] <= MAX_POSE_AGE_S)
 
     def observe(self, tags, frame_s):
-        if not self.poses:
+        if not self.poses or self.origin is None or (self.has_flight_status and not self.armed):
             return
         pose_s, (x, y, heading) = min(reversed(self.poses), key=lambda p: abs(p[0] - frame_s))
         if abs(pose_s - frame_s) > MAX_POSE_AGE_S:
@@ -135,8 +177,10 @@ class TagPlot:
         self.position_ax.legend(loc="upper left")
         self.map_ax.set(title="Persistent map: waiting for telemetry",
                         xlabel="Right from start (m)", ylabel="Forward from start (m)")
-        self.map_ax.set_aspect("equal", adjustable="datalim")
-        self.map_ax.margins(x=0.35, y=0.25)
+        self.map_ax.set_aspect("equal", adjustable="box")
+        self.map_ax.set_xlim(-3, 3)
+        self.map_ax.set_ylim(-3, 3)
+        self.map_ax.set_autoscale_on(False)
         self.map_ax.plot(0, 0, "g*", markersize=12, label="Drone start (0, 0)")
         self.path_line, = self.map_ax.plot([], [], "-", color="0.6", label="Drone path")
         self.drone_marker, = self.map_ax.plot([], [], "k^", markersize=8, label="Drone now")
@@ -157,6 +201,8 @@ class TagPlot:
     def _on_key(self, event):
         if event.key in ("q", "escape"):
             self.quit_requested = True
+        elif event.key == "r":
+            self.map.reset()
 
     def update(self, tags, elapsed_s, frame_s=None):
         """Update visible tags and accumulate located tags in the fixed map."""
@@ -198,6 +244,9 @@ class TagPlot:
                     color=marker.get_color()))
             self.position_ax.set_title(
                 "Current positions (top view)" if self.current else "No tags visible")
+            for tag_id in set(self.map_artists) - self.map.tags.keys():
+                for artist in self.map_artists.pop(tag_id):
+                    artist.remove()
             for tag_id, (fwd, right) in self.map.tags.items():
                 if tag_id not in self.map_artists:
                     color = self.markers[tag_id].get_color()
@@ -212,15 +261,24 @@ class TagPlot:
             if self.map.drone_path:
                 path_fwd, path_right = zip(*self.map.drone_path)
                 self.path_line.set_data(path_right, path_fwd)
-                if self.map.fresh(elapsed_s):
+                if self.map.fresh(elapsed_s) and (not self.map.has_flight_status or self.map.armed):
                     self.drone_marker.set_data([path_right[-1]], [path_fwd[-1]])
                 else:
                     self.drone_marker.set_data([], [])
-            self.map_ax.set_title("Persistent map (top view)" if self.map.fresh(elapsed_s)
-                                  else "Persistent map: waiting for telemetry")
-            for ax in (self.position_ax, self.map_ax):
-                ax.relim()
-                ax.autoscale_view()
+            else:
+                self.path_line.set_data([], [])
+                self.drone_marker.set_data([], [])
+            title = "Estimated flight path (top view)"
+            if not self.map.fresh(elapsed_s):
+                title = "Persistent map: waiting for telemetry"
+            elif self.map.has_flight_status and not self.map.armed:
+                dx, dy = self.map.preflight_delta
+                title = f"Disarmed: estimate drift N {dx:+.3f}, E {dy:+.3f} m"
+            elif not self.map.has_flight_status:
+                title = "Estimated path: flight status unavailable (r to reset)"
+            self.map_ax.set_title(title)
+            self.position_ax.relim()
+            self.position_ax.autoscale_view()
             self.figure.canvas.draw_idle()
         self.figure.canvas.flush_events()
 
@@ -274,9 +332,13 @@ def main():
     parser.add_argument("--plot-output", type=Path,
                         default=Path(time.strftime("tag_stream_plot_%Y%m%d_%H%M%S.png")),
                         help="saved plot path (default: timestamped PNG in current directory)")
+    parser.add_argument("--map-span", type=float, default=3.0,
+                        help="Fixed map half-width in metres (default 3); use toolbar to pan/zoom")
     args = parser.parse_args()
     if not math.isfinite(args.scale) or args.scale <= 0:
         parser.error("--scale must be positive and finite")
+    if not math.isfinite(args.map_span) or args.map_span <= 0:
+        parser.error("--map-span must be positive and finite")
     if not 1 <= args.telem_port <= 65535:
         parser.error("--telem-port must be 1-65535")
     try:
@@ -309,11 +371,14 @@ def main():
     window = "Drone camera + AprilTags"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     plot = TagPlot()
+    plot.map_ax.set_xlim(-args.map_span, args.map_span)
+    plot.map_ax.set_ylim(-args.map_span, args.map_span)
     started = time.monotonic()
     print(f"Asking {esp_ip} for video. q or Esc quits, s saves camera and plot.")
     print(f"Plot will be saved to {args.plot_output}")
-    print(f"Mapping uses telemetry on UDP {args.telem_port}; origin is the first valid "
-          "position and heading. Start this viewer before moving the drone.")
+    print(f"Mapping uses telemetry on UDP {args.telem_port}. TF01 firmware supplies flight status "
+          "and map offsets; path starts on arming, referenced to the last ground pose. "
+          "Legacy firmware uses the first position. Press r to clear/re-zero the map.")
     if args.telem_port == TELEM_MIRROR_PORT:
         print("Run send_trajectory.py or another CommsNode program alongside this viewer "
               "to supply telemetry for the persistent map.")
@@ -362,6 +427,8 @@ def main():
                     cv2.imwrite(path, view)
                     print(f"saved {path}")
                 plot.save(args.plot_output, time.monotonic() - started)
+            if key == ord("r"):
+                plot.map.reset()
     except KeyboardInterrupt:
         pass
     finally:

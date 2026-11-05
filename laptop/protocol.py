@@ -2,7 +2,7 @@
 Packet definitions for ESP32 ↔ laptop UDP protocol.
 
 Telemetry (ESP32 → laptop, 10 Hz):
-    Fixed-size packet.
+    55-byte legacy prefix, optionally followed by versioned flight status.
 
 Command (laptop → ESP32, event-driven):
     Fixed 22-byte mission packet, plus variable-size control packets.
@@ -64,6 +64,9 @@ NAV_STATE_NAMES = {
 #              nav_state, tag_id, tag_dist_m, vfh_blocked[32], is_stuck, reloc_age_s
 _TELEM_HDR_FMT  = "<BBfffBbf32sBH"
 _TELEM_HDR_SIZE = struct.calcsize(_TELEM_HDR_FMT)   # 55 bytes
+_FLIGHT_FMT = "<4sfffBBBIIff"
+_FLIGHT_SIZE = struct.calcsize(_FLIGHT_FMT)
+MISSION_BUSY, MISSION_READY, MISSION_FLYING = 0, 1, 2
 
 
 @dataclass
@@ -78,6 +81,22 @@ class TelemetryPacket:
     vfh_blocked: list            # VFH_BINS bools
     is_stuck:    bool
     reloc_age_s: int              # seconds since last nav-tag fix (0xFFFF = never)
+    flight_status_version: int | None = None
+    local_z: float | None = None
+    local_vz: float | None = None
+    ground_z: float | None = None
+    px4_armed: int | None = None
+    px4_custom_main_mode: int | None = None
+    mission_phase: int | None = None
+    px4_pos_age_ms: int | None = None
+    px4_hb_age_ms: int | None = None
+    map_offset_x: float | None = None
+    map_offset_y: float | None = None
+
+    @property
+    def px4_link_ok(self) -> bool:
+        return (self.px4_pos_age_ms is not None and self.px4_pos_age_ms < 500
+                and self.px4_hb_age_ms is not None and self.px4_hb_age_ms < 2000)
 
     @property
     def nav_state_name(self) -> str:
@@ -99,7 +118,7 @@ def parse_telemetry(data: bytes) -> Optional[TelemetryPacket]:
 
     vfh_blocked = [bool(b) for b in vfh_raw]
 
-    return TelemetryPacket(
+    packet = TelemetryPacket(
         drone_id    = drone_id,
         ned_x       = ned_x,
         ned_y       = ned_y,
@@ -111,6 +130,13 @@ def parse_telemetry(data: bytes) -> Optional[TelemetryPacket]:
         is_stuck    = bool(is_stuck),
         reloc_age_s = reloc_age_s,
     )
+    if len(data) >= _TELEM_HDR_SIZE + _FLIGHT_SIZE and data[55:59] == b"TF01":
+        (_, packet.local_z, packet.local_vz, packet.ground_z,
+         packet.px4_armed, packet.px4_custom_main_mode, packet.mission_phase,
+         packet.px4_pos_age_ms, packet.px4_hb_age_ms,
+         packet.map_offset_x, packet.map_offset_y) = struct.unpack_from(_FLIGHT_FMT, data, 55)
+        packet.flight_status_version = 1
+    return packet
 
 # ---------------------------------------------------------------------------
 # AprilTag debug packet  (drone → laptop, UDP port AT_DEBUG_PORT, 10 Hz)
