@@ -267,3 +267,67 @@ def test_stream_exit_saves_plot_and_releases_resources(monkeypatch, tmp_path, ex
     telemetry.close.assert_called_once()
     assert plots[0].map.tags[5] == pytest.approx((3, 4))
     assert not tag_stream.plt.get_fignums()
+
+
+def flight_pose(x=0, y=0, armed=False, offset=(0, 0), fresh=True):
+    return SimpleNamespace(ned_x=x + offset[0], ned_y=y + offset[1], heading_rad=0,
+                           flight_status_version=1, map_offset_x=offset[0], map_offset_y=offset[1],
+                           px4_armed=int(armed), px4_link_ok=fresh)
+
+
+def test_extended_preflight_drift_is_visible_but_not_a_flown_path(plot):
+    plot.map.update_pose(flight_pose(1, 2), 0)
+    plot.map.update_pose(flight_pose(1.04, 2), 0.1)
+    plot.update([detection()], 0.1)
+    plot.refresh(0.1)
+    assert plot.map.drone_path == []
+    assert plot.map.tags == {}
+    assert plot.map.preflight_delta == pytest.approx((0.04, 0))
+    assert 'Disarmed' in plot.map_ax.get_title()
+    assert '+0.040' in plot.map_ax.get_title()
+
+
+def test_map_offset_change_does_not_move_the_flight_path():
+    mapping = tag_stream.StartMap()
+    mapping.update_pose(flight_pose(1, 2), 0)
+    mapping.update_pose(flight_pose(1, 2, offset=(-2, 3)), 0.1)
+    assert mapping.preflight_delta == (0, 0)
+    mapping.update_pose(flight_pose(1, 2, armed=True, offset=(-2, 3)), 0.2)
+    mapping.update_pose(flight_pose(1, 2, armed=True, offset=(10, -8)), 0.3)
+    assert mapping.drone_path == [(0, 0), (0, 0)]
+    assert mapping.origin == (1, 2, 0)
+
+
+def test_landing_preserves_map_and_next_arming_starts_new_flight():
+    mapping = tag_stream.StartMap()
+    mapping.update_pose(flight_pose(), 0)
+    mapping.update_pose(flight_pose(armed=True), 0.1)
+    mapping.update_pose(flight_pose(1, armed=True), 0.2)
+    mapping.observe({5: (1, 0, 0)}, 0.2)
+    mapping.update_pose(flight_pose(1), 0.3)
+    assert mapping.drone_path == [(0, 0), (1, 0)]
+    assert 5 in mapping.tags
+    mapping.update_pose(flight_pose(1, armed=True), 0.4)
+    assert mapping.drone_path == [(0, 0)]
+    assert mapping.tags == {}
+
+
+def test_reset_clears_map_artists_and_fixed_scale_does_not_change(plot):
+    plot.map.update_pose(pose(), 0)
+    plot.update([detection()], 0)
+    plot.refresh(0)
+    before = (plot.map_ax.get_xlim(), plot.map_ax.get_ylim())
+    assert 5 in plot.map_artists
+    plot._on_key(SimpleNamespace(key='r'))
+    plot.refresh(0.2)
+    assert plot.map_artists == {}
+    assert len(plot.path_line.get_xdata()) == 0
+    assert before == (plot.map_ax.get_xlim(), plot.map_ax.get_ylim())
+
+
+def test_extended_stale_px4_data_not_drawn():
+    mapping = tag_stream.StartMap()
+    mapping.update_pose(flight_pose(), 0)
+    mapping.update_pose(flight_pose(5, fresh=False), 0.1)
+    assert mapping.preflight_delta == (0, 0)
+    assert len(mapping.poses) == 1

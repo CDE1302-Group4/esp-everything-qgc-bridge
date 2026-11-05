@@ -54,8 +54,8 @@ mission: CMD_START received
 mission: ToF disabled (TOF_ENABLED=0) — skipping pre-arm sensor check
 mission: OFFBOARD mode confirmed
 mission: Armed confirmed
-mission: Taking off to 0.5 m AGL (NED z=-0.50)...
-mission: Altitude reached: NED z=-0.3x (target=-0.50)
+mission: Climbing 0.50 m from ground z=0.00 to local z=-0.50
+mission: Stable hover confirmed at target local z=-0.50
 mission: Exploration mode — waiting for laptop goals...
 wifi: CMD_HOLD
 wifi: CMD_LAND
@@ -65,7 +65,7 @@ mission: Disarmed — mission complete
 mission: Mission loop complete — waiting for next CMD_START
 ```
 
-- Props off: `Takeoff timeout: NED z=0.0x ...` replaces `Altitude reached` (expected).
+- Props off: takeoff times out and requests landing; it must never enter exploration mode.
 - `Takeoff aborted: OFFBOARD refused (check QGC)` / `arming refused (check QGC)`:
   PX4 rejected it. Fix the cause in QGC and run again.
 - `Still armed after 20 s — land with RC`: take over and land with the RC.
@@ -90,7 +90,7 @@ No reboot needed. Wait for `Waiting for CMD_START from laptop...` and run again.
 
 ## Limitations
 
-- Telemetry has no altitude, armed state or flight mode: use QGC and the serial monitor.
+- Legacy telemetry has no altitude, armed state or flight mode. TF01 firmware adds these fields; older scripts may not consume them. Use QGC and the serial monitor to verify the actual flight.
 - Commands are not acknowledged: check `wifi: CMD_...` in the serial monitor.
 - A START sent too early is ignored. The script can't tell, so check the serial monitor.
 - `tag_id` / `tag_dist_m` in telemetry are info only, latched until the ESP32 reboots.
@@ -192,7 +192,7 @@ Heading hold is a command policy, not a guarantee of zero physical yaw motion.
 
 The transform is `tag_local_xy = uav_local_xy + Rz(heading) * tag_body_xyz`,
 using the mount transform from `apriltag_host.py`. **Roll and pitch are assumed
-zero** because the UDP telemetry contains only XY and yaw. The latest telemetry
+zero** because mission tag localization uses XY and yaw, without measured roll/pitch. The latest telemetry
 received before the image is used, not the UAV position after detection
 finishes; matches older than `--pose-max-age` (0.5 s) are rejected. These are
 receipt timestamps, not synchronized exposure timestamps, so transport delay
@@ -229,7 +229,7 @@ weaker firmware quality gate, not final mission acceptance. CSV includes only
 These changes apply to laptop mission recording immediately; they do not change
 the ESP32 detector or the raw observations displayed by `tag_stream.py`.
 
-Local tag Z is null by default because altitude is not transmitted. Optional
+Local tag Z is null by default because mission tag localization does not yet consume TF01 altitude. Optional
 `--assumed-altitude 0.5` estimates Z as `body_down - 0.5` during exploration and
 return only, explicitly marked as an assumption. It **does not command flight
 altitude**. START/GOTO use the firmware's cruise altitude (currently 0.5 m).
@@ -243,8 +243,8 @@ budget stops further searching and returns via reached goals, with exit status
 stale telemetry, or Ctrl+C requests LAND in place. LAND is repeated three times.
 Successful search and return with LAND sent exits 0; Ctrl+C exits 130.
 
-As with the base waypoint script, START/LAND are not acknowledged, and telemetry
-has no altitude, armed status, or landed status. The takeoff wait is configurable
+As with the base waypoint script, START/LAND are not acknowledged, and these
+mission scripts do not yet use the new TF01 flight-status fields. The takeoff wait is configurable
 (`--takeoff-wait`, default 12 s); confirm takeoff and final touchdown/disarm in
 QGC and the ESP serial monitor. Exit 0 means the route completed and LAND was
 sent, not that touchdown was verified. Detection does not cause landing on a tag.
@@ -319,7 +319,7 @@ radius, and a 1 s dwell. `--max-search-time` defaults to 300 s for the outbound
 route; return and landing require additional time. A missed waypoint or expired
 budget ends the outbound route and returns through reached points. Connection,
 camera, or return failures and Ctrl+C after START request landing in place.
-The existing telemetry cannot confirm takeoff or touchdown.
+These waypoint scripts do not yet use TF01 flight status to confirm takeoff; physical touchdown is not confirmed.
 
 The former script landed at the last supplied point and continued past missed
 points. Its default now returns to the recorded start and stops the outbound
@@ -330,3 +330,72 @@ the user is responsible for subsequent landing.
 ```bash
 python -m pytest -q tests/test_waypoint_csv_mission.py tests/test_exploration_mission.py
 ```
+
+## Verified takeoff and the 2 × 1 m spiral
+
+`send_trajectory.py` now requires the ESP32 **TF01 flight-status update**. Rebuild
+and flash the updated `main.c`, `mavlink_task.c`, `wifi_task.c`/`.h`, and new
+`takeoff_profile.h` before using it for flight. Older firmware is rejected before
+START; there is no timer-only fallback. QGC is not required by the sender.
+
+Firmware captures local ground Z immediately before requesting OFFBOARD and
+arming. It refreshes the ground hold while waiting for START and uses a five-second
+smooth position ramp to `ground_z - 0.5`, holding XY and heading. The nominal
+profile peaks at 0.15 m/s climb speed. Takeoff is complete only after the ramp
+ends and altitude is within 0.08 m of the target with vertical speed below
+0.10 m/s for one second. A 20-second takeoff timeout or lost position feedback
+requests landing instead of enabling trajectory playback. LAND commands respect
+RC mode takeover. These checks use PX4's estimate; they cannot correct a drifting
+height estimate, poorly tuned controller, or mechanical vibration.
+
+Telemetry retains its 55-byte prefix and appends a versioned 35-byte `TF01`
+trailer with local Z, vertical speed, ground Z, armed/mode/mission state, PX4
+message ages, and map offsets. Position freshness is not an EKF health guarantee.
+The sender uploads before takeoff, verifies the settled hover from fresh feedback,
+monitors flight throughout playback, and checks the endpoint before requesting
+LAND/HOLD. `--takeoff-wait` is now an optional minimum delay, not proof of takeoff.
+`--takeoff-timeout` defaults to 40 seconds including arming and confirmation.
+Stale laptop telemetry (>1 s), stale PX4 position (>=0.5 s), or stale heartbeat
+(>=2 s) aborts control and requests landing if the sender has taken control.
+RC takeover also stops playback monitoring; firmware does not switch back to
+OFFBOARD to force a landing. LAND delivery and physical touchdown are not acknowledged.
+
+The existing `trajectory/rectangle_spiral_2x1_slow.csv` needs no coordinate change:
+its Z goes from 0 to -0.5 relative to the verified 0.5 m starting hover, giving
+approximately 1.0 m above the captured ground reference. It already has a smooth
+climb and slow horizontal motion. It ends inside the spiral and lands there;
+it does not return to the starting point. In this CSV, X follows local NED north,
+not the drone's nose. Keep the documented initial placement and orientation.
+
+From the `laptop` directory, first inspect the route without connecting:
+
+```bash
+python send_trajectory.py --drone-id 15 --takeoff \
+  --trajectory ../trajectory/rectangle_spiral_2x1_slow.csv --dry-run
+```
+
+After flashing, open the viewer in one terminal, then run the sender in another:
+
+```bash
+python tag_stream.py --esp-ip 192.168.1.215 --fps 5 --map-span 3
+python send_trajectory.py --drone-id 15 --takeoff --confirm \
+  --trajectory ../trajectory/rectangle_spiral_2x1_slow.csv
+```
+
+With TF01 telemetry, the viewer removes explicit map offsets, displays preflight
+estimate drift as text, and starts a path on arming using the last ground pose.
+Arming is not proof of liftoff; the takeoff portion can still show estimator drift.
+After landing, the previous flight map remains visible until the next arming or
+an explicit reset. The map uses fixed axes (`--map-span` is the half-width in m),
+so autoscaling does not make stationary points appear to move. Press **r** to
+clear and re-zero the map; the toolbar still supports pan/zoom. Without TF01,
+the viewer labels its path as having unknown flight status and continues to show
+raw estimated motion. Reset a legacy map after applying configuration offsets.
+
+CSV Z remains **down-positive and relative to the first CSV point**. A file with
+constant Z=-1 does not command 1 m height. The sender prints the vertical offset
+range and planned final height. It rejects malformed/non-finite rows and retains
+the final point even if the CSV duration is not an exact multiple of `--dt`.
+The older exploration/waypoint scripts still use their existing timed takeoff wait
+and assumed-Z tag localization; they benefit from firmware takeoff gating but do
+not yet consume the new height feedback for their own takeoff confirmation.
