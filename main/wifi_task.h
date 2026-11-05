@@ -52,6 +52,19 @@ typedef struct __attribute__((packed)) {
     uint8_t  is_stuck;                      /* 1 = STUCK or RETREATING          */
 
     uint16_t reloc_age_s;                   /* always 0xFFFF (no nav-tag fixes) */
+
+    /* Versioned flight status. Keep the legacy 55-byte prefix unchanged. */
+    char     flight_magic[4];               /* "TF01"                           */
+    float    local_z;                       /* PX4 local NED down (m)           */
+    float    local_vz;                      /* PX4 vertical speed, down (m/s)   */
+    float    ground_z;                      /* local z captured before arming   */
+    uint8_t  armed;
+    uint8_t  main_mode;
+    uint8_t  mission_phase;
+    uint32_t position_age_ms;               /* UINT32_MAX until first message   */
+    uint32_t heartbeat_age_ms;
+    float    map_offset_x;                  /* map N = local N + offset         */
+    float    map_offset_y;
 } wifi_telem_pkt_t;
 
 /* ---------------------------------------------------------------------------
@@ -188,6 +201,7 @@ void wifi_clear_start_request(void);
  * FLYING, LAND ignored when READY. */
 typedef enum { MISSION_BUSY, MISSION_READY, MISSION_FLYING } mission_phase_t;
 void wifi_set_mission_phase(mission_phase_t phase);
+void wifi_set_ground_z(float ground_z);
 
 /* Returns true while the WiFi link is up (IP obtained, not disconnected). */
 bool wifi_is_connected(void);

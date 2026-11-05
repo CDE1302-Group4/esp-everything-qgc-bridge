@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -32,6 +33,7 @@ static const char *TAG = "wifi";
 static volatile bool s_land_requested  = false;
 static volatile bool s_start_requested = false;
 static volatile mission_phase_t s_phase = MISSION_BUSY;
+static volatile float s_ground_z = NAN;
 static volatile bool s_wifi_connected  = false;
 static volatile bool s_camera_stream_requested = false;
 static volatile uint32_t s_camera_stream_keepalive_ms = 0;
@@ -444,6 +446,22 @@ void wifi_task(void *arg)
 
         pkt.reloc_age_s = 0xFFFF;   /* never relocalised */
 
+        _Static_assert(sizeof(wifi_telem_pkt_t) == 90, "telemetry wire size");
+        _Static_assert(offsetof(wifi_telem_pkt_t, flight_magic) == 55, "telemetry legacy prefix");
+        memcpy(pkt.flight_magic, "TF01", sizeof(pkt.flight_magic));
+        pkt.local_z = drone.z;
+        pkt.local_vz = drone.vz;
+        pkt.ground_z = s_ground_z;
+        pkt.armed = drone.armed;
+        pkt.main_mode = drone.custom_main_mode;
+        pkt.mission_phase = (uint8_t)s_phase;
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        pkt.position_age_ms = drone.last_pos_ms ? now_ms - drone.last_pos_ms : UINT32_MAX;
+        pkt.heartbeat_age_ms = drone.last_hb_ms ? now_ms - drone.last_hb_ms : UINT32_MAX;
+        /* Use the same odom_to_map snapshot as the reported map position. */
+        pkt.map_offset_x = pkt.ned_x - drone.x;
+        pkt.map_offset_y = pkt.ned_y - drone.y;
+
         /* ---- Send telemetry ---- */
         send(tx_sock, &pkt, sizeof(pkt), 0);
 
@@ -529,6 +547,11 @@ void wifi_clear_start_request(void)
 void wifi_set_mission_phase(mission_phase_t phase)
 {
     s_phase = phase;
+}
+
+void wifi_set_ground_z(float ground_z)
+{
+    s_ground_z = ground_z;
 }
 
 bool wifi_is_connected(void)

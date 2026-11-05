@@ -243,6 +243,35 @@ Full procedure: [waypoints/WAYPOINT_FLIGHT_TEST_GUIDE.md](waypoints/WAYPOINT_FLI
 
 ## 6. Fly from a CSV trajectory
 
+`send_trajectory.py` automatically supports the original ESP32 telemetry;
+**no reflash is needed**. With the original 55-byte packets, it uses
+`--takeoff-wait` (default 12 s), requires fresh telemetry throughout, confirms
+trajectory start/completion and checks the horizontal endpoint. These packets
+do not report height, armed/mode state or PX4 message ages: confirm takeoff and
+hover visually or in QGC. Without `--takeoff`, establish a hover first.
+
+If TF01 height/status telemetry is available, the sender additionally verifies
+a settled 0.5 m takeoff, monitors arm/mode and PX4 freshness, and checks the 3D
+endpoint. It never silently changes telemetry mode during a session. The full
+procedure and telemetry format are in
+[the verified takeoff guide](laptop/TEST_GUIDE.md#verified-takeoff-and-the-2--1-m-spiral).
+
+The firmware upgrade below is optional and enables the additional TF01 checks.
+On Windows, use an ESP-IDF terminal at the repository root. Run
+`idf.py menuconfig` and select **Drone Configuration**: set **Drone ID** to the
+physical drone's ID, **Drone static IPv4 address** to `192.168.1.(200 + ID)`,
+and **IPV4 Address** to the laptop's actual telemetry IP (the project convention
+is `192.168.1.(100 + ID)`). Save, then run:
+
+```powershell
+idf.py build
+idf.py -p COM_PORT flash monitor
+```
+
+Replace `COM_PORT` with the ESP32's actual serial port. For drone 4 the ID is
+`4` and drone IP is `192.168.1.204`; do not flash a build configured for another
+drone. Use `--dry-run` to validate a CSV without connecting to a drone.
+
 This is a 2x1 ellipse minimum-snap trajectory. Put the drone at the tip of the major axis, facing outward. The takeoff placement can be seen in `trajectory/ellipse_start_placement.png`.
 
 ```bash

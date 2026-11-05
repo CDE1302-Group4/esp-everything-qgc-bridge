@@ -342,6 +342,8 @@ static void send_setpoint(void)
         // Position / hold / pos+vel mode: unused velocity and yaw_rate fields MUST be NaN.
         bool  pv  = (sp.type == SP_POS_VEL);
         float yaw = (sp.type == SP_HOLD) ? NAN : sp.yaw;
+        uint16_t mask = pv ? TYPEMASK_POS_VEL : TYPEMASK_POSITION;
+        if (!isfinite(yaw)) mask |= POSITION_TARGET_TYPEMASK_YAW_IGNORE;
         mavlink_msg_set_position_target_local_ned_pack(
             OBC_SYSID,
             OBC_COMPID,
@@ -350,7 +352,7 @@ static void send_setpoint(void)
             PX4_SYSID,
             PX4_COMPID,
             MAV_FRAME_LOCAL_NED,
-            pv ? TYPEMASK_POS_VEL : TYPEMASK_POSITION,
+            mask,
             sp.x, sp.y, sp.z,           // position  — used
             pv ? sp.vx : NAN,           // velocity  — feedforward in pos+vel mode
             pv ? sp.vy : NAN,
@@ -672,11 +674,14 @@ bool mavlink_position_valid(void)
 {
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     uint32_t last = s_state.last_pos_ms;
+    uint32_t heartbeat = s_state.last_hb_ms;
+    bool finite = isfinite(s_state.x) && isfinite(s_state.y) && isfinite(s_state.z)
+               && isfinite(s_state.vz) && isfinite(s_state.heading);
     xSemaphoreGive(s_state_mutex);
 
-    if (last == 0) return false;
+    if (last == 0 || heartbeat == 0 || !finite) return false;
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    return (now - last) < 500;
+    return (now - last) < 500 && (now - heartbeat) < 2000;
 }
 
 

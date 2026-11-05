@@ -121,6 +121,6 @@ void mavlink_send_land_command(void);
 // Thread-safe snapshot — safe to call from any task.
 drone_state_t mavlink_get_state(void);
 
-// Convenience: true if we have received position data recently (< 500ms)
+// Finite local pose, position age < 500ms, heartbeat age < 2000ms.
 bool mavlink_position_valid(void);
 

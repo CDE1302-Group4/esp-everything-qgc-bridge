@@ -129,10 +129,17 @@ def test_firmware_telemetry_layout_matches_python(tmp_path):
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 #include "wifi_task.h"
 _Static_assert(sizeof(wifi_telem_pkt_t)==90, "wire size");
 _Static_assert(offsetof(wifi_telem_pkt_t,flight_magic)==55, "legacy prefix");
 int main(void) {
+#ifdef _WIN32
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
     wifi_telem_pkt_t p={.pkt_type=1,.drone_id=15,.local_z=-0.7f,.local_vz=0.02f,
         .ground_z=-0.2f,.armed=1,.main_mode=6,.mission_phase=2,.position_age_ms=20,
         .heartbeat_age_ms=150,.map_offset_x=-2,.map_offset_y=3};
@@ -141,7 +148,10 @@ int main(void) {
 }
 ''')
     exe = tmp_path / 'wire'
-    subprocess.run([compiler, '-std=c11', '-I', str(source), '-I', str(main_dir), '-I', str(tmp_path),
+    # MinGW's default Microsoft layout can override GCC's packed attribute.
+    # Match the ESP GCC ABI, and keep stdout binary for the captured wire bytes.
+    layout_flags = ['-mno-ms-bitfields'] if os.name == 'nt' else []
+    subprocess.run([compiler, '-std=c11', *layout_flags, '-I', str(source), '-I', str(main_dir), '-I', str(tmp_path),
                     str(harness), '-o', str(exe)], check=True)
     wire = subprocess.check_output([str(exe)])
     import sys

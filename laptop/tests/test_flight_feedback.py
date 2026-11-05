@@ -39,7 +39,7 @@ def test_wire_extension_and_legacy():
 
 
 @pytest.mark.parametrize('changes,match', [
-    ({'flight_status_version': None}, 'Rebuild and flash'),
+    ({'flight_status_version': 99}, 'Unsupported'),
     ({'px4_pos_age_ms': 600}, 'stale'),
     ({'px4_hb_age_ms': 2100}, 'stale'),
     ({'local_z': float('nan')}, 'invalid'),
@@ -48,6 +48,34 @@ def test_rejects_unusable_feedback(changes, match):
     feedback = sender.FlightFeedback(15)
     feedback.update(packet(**changes), 'drone')
     with pytest.raises((RuntimeError, ConnectionError), match=match):
+        feedback.packet()
+
+
+def legacy_packet(**changes):
+    raw = struct.pack('<BBfffBbf32sBH', 1, 15, 0, 0, 0, NAV_IDLE, -1, 0, bytes(32), 0, 65535)
+    return replace(parse_telemetry(raw), **changes)
+
+
+def test_legacy_feedback_accepts_only_available_fields_and_rejects_format_changes():
+    feedback = sender.FlightFeedback(15)
+    old = legacy_packet()
+    feedback.update(old, 'drone')
+    assert feedback.packet() is old
+    assert old.local_z is None and old.px4_armed is None
+    feedback.update(legacy_packet(ned_x=float('nan')), 'drone')
+    with pytest.raises(RuntimeError, match='invalid'):
+        feedback.packet()
+    feedback.update(packet(), 'drone')
+    with pytest.raises(RuntimeError, match='format changed'):
+        feedback.packet()
+
+
+def test_extended_feedback_never_silently_downgrades_to_legacy():
+    feedback = sender.FlightFeedback(15)
+    feedback.update(packet(), 'drone')
+    feedback.packet()
+    feedback.update(legacy_packet(), 'drone')
+    with pytest.raises(RuntimeError, match='format changed'):
         feedback.packet()
 
 
@@ -91,7 +119,7 @@ def test_constant_height_and_partial_endpoint(tmp_path):
     assert p[-1, 0] == 0.02
 
 
-@pytest.mark.parametrize('failure', [None, 'legacy', 'wrong_height', 'stale', 'takeover', 'stalled_endpoint'])
+@pytest.mark.parametrize('failure', [None, 'wrong_height', 'stale', 'takeover', 'stalled_endpoint'])
 def test_sender_flight_flow(tmp_path, monkeypatch, failure):
     path = tmp_path / 'route.csv'
     path.write_text('t,x,y,z\n0,0,0,0\n2,0.1,0,0\n')
@@ -101,7 +129,7 @@ def test_sender_flight_flow(tmp_path, monkeypatch, failure):
     comms = Mock()
     callback = [None]
     def deliver():
-        p = packet(flight_status_version=None if failure == 'legacy' else 1)
+        p = packet()
         if state['start'] is not None:
             elapsed = now[0] - state['start']
             if failure == 'stale' and elapsed > 0.2:
@@ -140,20 +168,107 @@ def test_sender_flight_flow(tmp_path, monkeypatch, failure):
     comms.send_raw.side_effect = send_raw
     monkeypatch.setattr(sender, 'CommsNode', lambda **kw: comms)
     monkeypatch.setattr(sender, 'time', SimpleNamespace(monotonic=lambda: now[0], sleep=sleep))
-    args = ['--drone-id', '15', '--trajectory', str(path), '--takeoff', '--takeoff-timeout', '5']
+    args = ['--drone-id', '15', '--trajectory', str(path), '--takeoff',
+            '--takeoff-wait', '0', '--takeoff-timeout', '5']
     if failure:
         with pytest.raises((RuntimeError, ConnectionError, TimeoutError)):
             sender.main(args)
-        if failure == 'legacy':
-            assert commands == [] and uploads == []
-        else:
-            assert commands[-3:] == [CMD_LAND]*3
-            if failure != 'stalled_endpoint':
-                assert 9 not in uploads
+        assert commands[-3:] == [CMD_LAND]*3
+        if failure != 'stalled_endpoint':
+            assert 9 not in uploads
     else:
         sender.main(args)
         assert commands == [CMD_START, CMD_LAND, CMD_LAND, CMD_LAND]
         assert uploads == [8, 9]
+    comms.stop.assert_called_once()
+
+
+@pytest.mark.parametrize('failure,takeoff,finish', [
+    (None, True, 'land'),
+    (None, False, 'hold'),
+    ('takeoff_stale', True, 'land'),
+    ('playback_stale', True, 'land'),
+    ('no_start', True, 'land'),
+    ('interrupted', True, 'land'),
+    ('stalled_endpoint', True, 'land'),
+    ('format_change', True, 'land'),
+])
+def test_legacy_sender_flight_flow(tmp_path, monkeypatch, caplog, failure, takeoff, finish):
+    path = tmp_path / 'legacy.csv'
+    # Include vertical motion: old firmware plays Z offsets even though it
+    # cannot report Z back. It must not be replaced with an invented height.
+    path.write_text('t,x,y,z\n0,0,0,0\n2,0.1,0,-0.2\n')
+    now = [0.0]
+    commands, uploads = [], []
+    state = {'start': None, 'traj': None}
+    callback = [None]
+    comms = Mock()
+
+    def deliver():
+        if (failure == 'takeoff_stale' and state['start'] is not None
+                and now[0] - state['start'] > 0.2):
+            return
+        p = legacy_packet()
+        if failure == 'format_change' and state['start'] is not None:
+            p = packet()
+        if state['traj'] is not None:
+            elapsed = now[0] - state['traj']
+            if failure == 'playback_stale' and elapsed > 0.2:
+                return
+            done = elapsed >= 2
+            p = replace(p, nav_state=NAV_ARRIVED if done else NAV_TRAJ,
+                        ned_x=0.1 if done and failure != 'stalled_endpoint' else 0)
+            if done and failure == 'stalled_endpoint':
+                p = replace(p, ned_x=-1)
+            if failure == 'interrupted' and elapsed > 0.2:
+                p = replace(p, nav_state=NAV_IDLE)
+        callback[0](p, 'drone')
+
+    def sleep(seconds):
+        now[0] += seconds
+        deliver()
+
+    def send_command(_id, command):
+        commands.append(command.cmd_type)
+        if command.cmd_type == CMD_START:
+            state['start'] = now[0]
+        deliver()
+        return True
+
+    def send_raw(_id, data):
+        uploads.append(data[1])
+        if data[1] == 9:
+            if takeoff:
+                assert now[0] - state['start'] >= 12  # default compatibility wait
+            if failure != 'no_start':
+                state['traj'] = now[0]
+        deliver()
+        return True
+
+    comms.on_telemetry.side_effect = lambda cb: callback.__setitem__(0, cb)
+    comms.start.side_effect = deliver
+    comms.send_command.side_effect = send_command
+    comms.send_raw.side_effect = send_raw
+    monkeypatch.setattr(sender, 'CommsNode', lambda **kw: comms)
+    monkeypatch.setattr(sender, 'time', SimpleNamespace(monotonic=lambda: now[0], sleep=sleep))
+    monkeypatch.setattr('builtins.input', lambda prompt: 'TRAJ-15')
+    args = ['--drone-id', '15', '--trajectory', str(path), '--confirm', '--finish', finish]
+    if takeoff:
+        args += ['--takeoff']
+    if failure:
+        with pytest.raises((RuntimeError, ConnectionError, TimeoutError)):
+            sender.main(args)
+        assert commands[-3:] == [CMD_LAND] * 3
+        if failure in ('takeoff_stale', 'format_change'):
+            assert 9 not in uploads
+    else:
+        sender.main(args)
+        from protocol import CMD_HOLD
+        expected = [CMD_START] if takeoff else []
+        expected += [CMD_LAND] * 3 if finish == 'land' else [CMD_HOLD]
+        assert commands == expected
+        assert uploads == [8, 9]
+        assert 'Legacy telemetry detected' in caplog.text
     comms.stop.assert_called_once()
 
 

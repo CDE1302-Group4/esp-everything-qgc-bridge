@@ -333,10 +333,23 @@ python -m pytest -q tests/test_waypoint_csv_mission.py tests/test_exploration_mi
 
 ## Verified takeoff and the 2 × 1 m spiral
 
-`send_trajectory.py` now requires the ESP32 **TF01 flight-status update**. Rebuild
-and flash the updated `main.c`, `mavlink_task.c`, `wifi_task.c`/`.h`, and new
-`takeoff_profile.h` before using it for flight. Older firmware is rejected before
-START; there is no timer-only fallback. QGC is not required by the sender.
+`send_trajectory.py` automatically supports existing firmware without reflashing.
+For the original 55-byte telemetry, `--takeoff` uses `--takeoff-wait` (default
+12 s) while checking that drone telemetry keeps arriving. The sender confirms
+NAV_TRAJ and NAV_ARRIVED and checks the XY endpoint before finishing. Altitude,
+vertical speed, armed/mode state and PX4 message ages are unavailable, so it
+cannot verify takeoff, vertical tracking or RC takeover from those packets.
+Confirm takeoff/hover visually or in QGC; without `--takeoff`, establish the
+hover first. Packet loss, invalid XY/heading, missing start confirmation,
+interrupted playback and endpoint timeout still abort the sender. Once it has
+requested START or taken control of an existing hover, an abort requests LAND.
+Legacy `--takeoff` requires a positive takeoff wait. No compatibility flag is
+needed, and the sender does not invent missing altitude/status values.
+
+The optional **TF01 flight-status update** enables the verified checks below.
+To use it, rebuild and flash `main.c`, `mavlink_task.c`, `wifi_task.c`/`.h`, and
+`takeoff_profile.h`. QGC is not required by the sender. A telemetry format
+change after connection aborts the session, preserving TF01 checks when present.
 
 Firmware captures local ground Z immediately before requesting OFFBOARD and
 arming. It refreshes the ground hold while waiting for START and uses a five-second
@@ -351,9 +364,9 @@ height estimate, poorly tuned controller, or mechanical vibration.
 Telemetry retains its 55-byte prefix and appends a versioned 35-byte `TF01`
 trailer with local Z, vertical speed, ground Z, armed/mode/mission state, PX4
 message ages, and map offsets. Position freshness is not an EKF health guarantee.
-The sender uploads before takeoff, verifies the settled hover from fresh feedback,
+With TF01, the sender uploads before takeoff, verifies the settled hover from fresh feedback,
 monitors flight throughout playback, and checks the endpoint before requesting
-LAND/HOLD. `--takeoff-wait` is now an optional minimum delay, not proof of takeoff.
+LAND/HOLD. `--takeoff-wait` is a minimum delay (default 12 s), not proof of takeoff.
 `--takeoff-timeout` defaults to 40 seconds including arming and confirmation.
 Stale laptop telemetry (>1 s), stale PX4 position (>=0.5 s), or stale heartbeat
 (>=2 s) aborts control and requests landing if the sender has taken control.
@@ -374,7 +387,8 @@ python send_trajectory.py --drone-id 15 --takeoff \
   --trajectory ../trajectory/rectangle_spiral_2x1_slow.csv --dry-run
 ```
 
-After flashing, open the viewer in one terminal, then run the sender in another:
+Open the viewer in one terminal, then run the sender in another (these commands
+also work with the existing firmware):
 
 ```bash
 python tag_stream.py --esp-ip 192.168.1.215 --fps 5 --map-span 3

@@ -8,8 +8,10 @@ jitter do not set the playback timing. Fresh flight feedback is still required.
 
 CSV: columns t,x,y,z (s, NED m); a header row and '#' comments are allowed.
 The trajectory is flown relative to where the drone hovers when it starts.
-Z is down-positive; constant CSV Z means no climb. Requires TF01 flight-status
-firmware for verified takeoff and height monitoring. Use --dry-run offline.
+Z is down-positive; constant CSV Z means no climb. TF01 telemetry enables
+verified takeoff and height monitoring. Older firmware is detected automatically:
+it uses --takeoff-wait (12 s by default) and verifies the horizontal endpoint,
+without height, arm/mode, or PX4 sample-age feedback. Use --dry-run offline.
 
 Example:
     python3 laptop/send_trajectory.py --drone-id 2 --takeoff --confirm \
@@ -92,6 +94,7 @@ class FlightFeedback:
         self.stale_timeout = stale_timeout
         self._latest = None
         self._lock = threading.Lock()
+        self._extended_status = None
 
     def update(self, packet, _ip):
         if packet.drone_id == self.drone_id:
@@ -106,14 +109,19 @@ class FlightFeedback:
         packet, received = latest
         if time.monotonic() - received > self.stale_timeout:
             raise ConnectionError("Drone telemetry is stale")
-        if packet.flight_status_version != 1:
-            raise RuntimeError("Firmware lacks TF01 height/status telemetry. Rebuild and flash the "
-                               "takeoff update before flying; --dry-run works without a drone.")
-        if not packet.px4_link_ok:
+        if packet.flight_status_version not in (None, 1):
+            raise RuntimeError("Unsupported flight-status telemetry version")
+        extended = packet.flight_status_version == 1
+        if self._extended_status is not None and extended != self._extended_status:
+            raise RuntimeError("Flight-status telemetry format changed during this session")
+        if extended and not packet.px4_link_ok:
             raise ConnectionError("PX4 position or heartbeat is stale")
-        if not all(v is not None and math.isfinite(v) for v in (
-                packet.ned_x, packet.ned_y, packet.heading_rad, packet.local_z, packet.local_vz)):
+        values = (packet.ned_x, packet.ned_y, packet.heading_rad)
+        if extended:
+            values += (packet.local_z, packet.local_vz)
+        if not all(v is not None and math.isfinite(v) for v in values):
             raise RuntimeError("PX4 position contains invalid numbers")
+        self._extended_status = extended
         return packet
 
     def wait_connected(self, timeout=30.0):
@@ -168,8 +176,9 @@ def main(argv=None) -> None:
     ap.add_argument("--max-speed", type=float, default=0.30,
                     help="Refuse faster trajectories (m/s); keep below MAV_CMD_SPEED_CAP_MS")
     ap.add_argument("--takeoff", action="store_true", help="Send CMD_START (arm + take off) first")
-    ap.add_argument("--takeoff-wait", type=float, default=0.0,
-                    help="Optional minimum wait after START; measured hover is always required")
+    ap.add_argument("--takeoff-wait", type=float, default=12.0,
+                    help="Wait after START (default 12 s); TF01 also requires measured hover, "
+                         "legacy firmware uses this timed wait with fresh telemetry")
     ap.add_argument("--finish", choices=["land", "hold"], default="land",
                     help="Action after the trajectory")
     ap.add_argument("--confirm", action="store_true",
@@ -177,7 +186,7 @@ def main(argv=None) -> None:
     ap.add_argument("--telem-port", type=int, default=5005)
     ap.add_argument("--cmd-port", type=int, default=5006)
     ap.add_argument("--takeoff-timeout", type=float, default=40.0,
-                    help="Maximum wait for verified 0.5 m takeoff and hover")
+                    help="Maximum takeoff wait (default 40 s)")
     ap.add_argument("--dry-run", action="store_true", help="Validate and describe the CSV without connecting")
     args = ap.parse_args(argv)
     if not all(math.isfinite(v) and v > 0 for v in (args.dt, args.max_speed, args.takeoff_timeout)):
@@ -206,7 +215,7 @@ def main(argv=None) -> None:
     log.info("CSV Z offsets: %.3f to %.3f m (negative climbs); final offset %.3f m",
              pts[:, 2].min(), pts[:, 2].max(), pts[-1, 2])
     if args.takeoff:
-        log.info("Required takeoff: 0.50 m above ground reference; planned final height %.3f m",
+        log.info("Assuming 0.50 m takeoff; nominal final height %.3f m (TF01 verifies takeoff height)",
                  0.5 - pts[-1, 2])
         if np.max(pts[:, 2]) >= 0.5 - 0.10:
             ap.error("Trajectory descends to within 0.10 m of the ground reference")
@@ -230,7 +239,15 @@ def main(argv=None) -> None:
     try:
         comms.start()
         initial = feedback.wait_connected()
-        if args.takeoff and (initial.px4_armed or initial.mission_phase != MISSION_READY):
+        extended = initial.flight_status_version == 1
+        if not extended:
+            if args.takeoff and args.takeoff_wait <= 0:
+                raise RuntimeError("Legacy firmware requires a positive --takeoff-wait (default 12 s)")
+            log.warning("Legacy telemetry detected: altitude, armed/mode and PX4 sample ages "
+                        "are unavailable. Using timed takeoff and XY endpoint checks; no reflash required.")
+            if initial.nav_state == NAV_TRAJ:
+                raise RuntimeError("Drone is already playing a trajectory")
+        if extended and args.takeoff and (initial.px4_armed or initial.mission_phase != MISSION_READY):
             raise RuntimeError("Takeoff requires the drone to be disarmed and firmware READY")
 
         if args.confirm:
@@ -240,9 +257,11 @@ def main(argv=None) -> None:
                 return
         # Recheck after a potentially long confirmation prompt.
         initial = feedback.packet()
-        if args.takeoff and (initial.px4_armed or initial.mission_phase != MISSION_READY):
+        if not extended and initial.nav_state == NAV_TRAJ:
+            raise RuntimeError("Drone is already playing a trajectory")
+        if extended and args.takeoff and (initial.px4_armed or initial.mission_phase != MISSION_READY):
             raise RuntimeError("Drone is no longer ready for takeoff")
-        if not args.takeoff and not at_hover(initial):
+        if extended and not args.takeoff and not at_hover(initial):
             raise RuntimeError("Without --takeoff, a stable armed OFFBOARD hover is required")
 
         traj_id = random.randint(1, 255)
@@ -258,27 +277,36 @@ def main(argv=None) -> None:
         upload()  # upload on the ground before START whenever possible
         if args.takeoff:
             initial = feedback.packet()
-            if initial.px4_armed or initial.mission_phase != MISSION_READY:
+            if extended and (initial.px4_armed or initial.mission_phase != MISSION_READY):
                 raise RuntimeError("Drone is no longer ready for takeoff")
             flying = True  # an uncertain START transmission must still trigger cleanup
             send(CMD_START, "CMD_START")
             started = time.monotonic()
-            feedback.wait(lambda p: time.monotonic() - started >= args.takeoff_wait
-                          and at_hover(p, 0.5), args.takeoff_timeout, stable_for=1.0)
+            if extended:
+                feedback.wait(lambda p: time.monotonic() - started >= args.takeoff_wait
+                              and at_hover(p, 0.5), args.takeoff_timeout, stable_for=1.0)
+            else:
+                log.info("Waiting %.1f s after START; confirm takeoff/hover in QGC or visually",
+                         args.takeoff_wait)
+                feedback.wait(lambda p: time.monotonic() - started >= args.takeoff_wait,
+                              args.takeoff_timeout)
         else:
             flying = True
-            feedback.wait(at_hover, 5.0, stable_for=1.0, require_flying=True)
+            if extended:
+                feedback.wait(at_hover, 5.0, stable_for=1.0, require_flying=True)
+            else:
+                log.info("Using the existing hover; legacy telemetry cannot verify it")
 
         start = build_traj_start(traj_id, dt_ms)
         origin = None
         for attempt in range(3):
             origin = feedback.packet()
-            if not at_hover(origin, 0.5 if args.takeoff else None):
+            if extended and not at_hover(origin, 0.5 if args.takeoff else None):
                 raise RuntimeError("Hover lost before trajectory start")
             if not comms.send_raw(args.drone_id, start):
                 raise ConnectionError("Trajectory START could not be sent")
             try:
-                feedback.wait(lambda p: p.nav_state == NAV_TRAJ, 1.5, require_flying=True)
+                feedback.wait(lambda p: p.nav_state == NAV_TRAJ, 1.5, require_flying=extended)
                 break
             except TimeoutError:
                 # Only re-upload if fresh feedback proves playback never started.
@@ -286,11 +314,23 @@ def main(argv=None) -> None:
                     raise RuntimeError("Trajectory start was not confirmed")
                 upload()
         log.info("Playing trajectory %d (%.1f s)", traj_id, duration)
-        feedback.wait(lambda p: p.nav_state == NAV_ARRIVED, duration + 5.0, require_flying=True)
-        target = np.array([origin.ned_x, origin.ned_y, origin.local_z]) + pts[-1]
-        feedback.wait(lambda p: np.linalg.norm(np.array([p.ned_x, p.ned_y, p.local_z]) - target) < 0.15
-                      and abs(p.local_vz) < 0.10, 10.0, stable_for=1.0, require_flying=True)
-        log.info("Trajectory endpoint reached; measured local z=%.3f", feedback.packet().local_z)
+        def trajectory_done(packet):
+            if packet.nav_state not in (NAV_TRAJ, NAV_ARRIVED):
+                raise RuntimeError("Trajectory playback stopped before arrival")
+            return packet.nav_state == NAV_ARRIVED
+
+        feedback.wait(trajectory_done, duration + 5.0, require_flying=extended)
+        if extended:
+            target = np.array([origin.ned_x, origin.ned_y, origin.local_z]) + pts[-1]
+            feedback.wait(lambda p: np.linalg.norm(np.array([p.ned_x, p.ned_y, p.local_z]) - target) < 0.15
+                          and abs(p.local_vz) < 0.10, 10.0, stable_for=1.0, require_flying=True)
+            log.info("Trajectory endpoint reached; measured local z=%.3f", feedback.packet().local_z)
+        else:
+            target_xy = np.array([origin.ned_x, origin.ned_y]) + pts[-1, :2]
+            feedback.wait(lambda p: p.nav_state == NAV_ARRIVED
+                          and np.linalg.norm(np.array([p.ned_x, p.ned_y]) - target_xy) < 0.15,
+                          10.0, stable_for=1.0)
+            log.info("Trajectory endpoint reached in XY; altitude is unavailable on legacy firmware")
         if args.finish == "land":
             for _ in range(3):
                 send(CMD_LAND, "CMD_LAND")

@@ -32,6 +32,28 @@ python3 laptop/send_trajectory.py --drone-id 22 --takeoff --takeoff-wait 12 --co
     --trajectory trajectory/circle_traj.csv
 ```
 
+## Simple three-sided rectangle
+
+`rectangle_min_snap_traj.csv` uses the same `t,x,y,z` format and 0.01 s sample
+interval as the ellipse. Starting at `(0, 0)`, its horizontal corners are:
+
+`(0, 0) -> (1.5, 0) -> (1.5, 1) -> (0, 1)`
+
+Face **NED +x (North)**. The path goes **forward 1.5 m**, **right 1 m**, then
+turns right along the rectangle to travel **backward 1.5 m** and stops there.
+The drone holds its initial heading throughout. It follows three sides and
+finishes 1 m to the right of the starting position.
+
+Each leg uses a seventh-order minimum-snap profile, starting and ending at
+rest with zero acceleration and jerk. Speed stays below **0.20 m/s**. All Z
+offsets are zero, preserving the starting hover altitude. Duration is
+**45.85 seconds**, including a final 2-second hold; the default uploader uses
+918 points. `--finish hold` keeps hovering at the last corner after playback.
+
+```powershell
+python laptop/send_trajectory.py --drone-id 4 --takeoff --takeoff-wait 12 --confirm --trajectory trajectory/rectangle_min_snap_traj.csv --finish hold
+```
+
 ## Slow 2 m by 1 m rectangular spiral
 
 `rectangle_spiral_2x1_slow.csv` starts at the centre of the near 1 m edge,
