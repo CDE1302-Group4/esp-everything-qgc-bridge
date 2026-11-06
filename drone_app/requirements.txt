@@ -1,0 +1,2 @@
+-r ../laptop/requirements.txt
+Pillow>=9

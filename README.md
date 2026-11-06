@@ -106,6 +106,8 @@ OpenCV or SciPy from source.
    conda deactivate                          # when done
    ```
 
+   python laptop/tag_stream.py --esp-ip 192.168.1.204 --plot-output laptop/tags.png
+
 After `laptop/requirements.txt` changes, update the environment with
 `conda env update -f laptop/environment.yml`. The laptop tests run with
 `cd laptop && python -m pytest tests`.
@@ -275,11 +277,15 @@ drone. Use `--dry-run` to validate a CSV without connecting to a drone.
 This is a 2x1 ellipse minimum-snap trajectory. Put the drone at the tip of the major axis, facing outward. The takeoff placement can be seen in `trajectory/ellipse_start_placement.png`.
 
 ```bash
-python3 laptop/send_trajectory.py --takeoff --takeoff-wait 12 \
-  --trajectory trajectory/ellipse_min_snap_traj.csv --confirm \
-  --drone-id [DRONE_ID]
+python laptop/send_trajectory.py --takeoff --takeoff-wait 12 --trajectory trajectory/ellipse_min_snap_traj.csv --confirm --drone-id 4
 ```
 
 `--confirm` asks for `TRAJ-[drone ID]` before anything is sent.
 
 See `trajectory/README.md` for the included circle and compact minimum-snap ellipse, how to regenerate their CSV files, and the space each path needs.
+
+python laptop/tag_stream.py --esp-ip 192.168.1.204 --plot-output laptop/tags.png
+
+python laptop/send_trajectory.py --takeoff --takeoff-wait 12 --trajectory trajectory/ellipse_min_snap_traj.csv --confirm --drone-id 4
+
+python drone_app/app.py
