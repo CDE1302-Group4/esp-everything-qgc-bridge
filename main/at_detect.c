@@ -221,7 +221,7 @@ int avg_img(image_u8_t* im) {
   return sum;
 }
 // ESP32 Cam Parameters!
-// Tag Size in meters?
+// Tag Size in meters
 #define TAG_SIZE 0.12
 #define F_X 163.5047216
 #define F_Y 153.22210511

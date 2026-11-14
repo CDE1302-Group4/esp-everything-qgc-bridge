@@ -32,10 +32,12 @@ def test_detector_cache_is_separate_from_existing_viewer():
 
 def test_included_routes_validate_and_preview_without_network():
     for path in (REPO_ROOT / "trajectory").glob("*.csv"):
-        route = Route.load(path)
+        # Same interval drone_terminal picks: the CSV's own step, coarsened to fit.
+        from drone_terminal.app import fit_csv_dt
+        route = Route.load(path, fit_csv_dt(path))
         assert len(route.points) <= 2400
-        assert route.peak_speed <= .30 + 1e-6
-        assert np.allclose(route.points[0], (0, 0, 0))
+        assert route.peak_speed <= .30 + 1e-4
+        assert np.allclose(route.points[0, :3], (0, 0, 0))  # yaw column is absolute
         assert not route.points.flags.writeable
 
 
@@ -154,3 +156,17 @@ def test_stale_feedback_prevents_any_operation():
         session.launch(takeoff=True)
     session.comms.send_command.assert_not_called()
     assert not session.busy
+
+
+def test_goto_yaw_packet_matches_firmware_struct():
+    import struct
+    from protocol import CMD_GOTO_YAW, PKT_CMD, build_goto_yaw
+    data = build_goto_yaw(1.5, -2.0, math.pi / 2, [3, 7])
+    # wifi_goto_yaw_pkt_t: u8 pkt, u8 cmd, f32 x, f32 y, f32 yaw, i8 tags[12]
+    assert len(data) == 26
+    pkt, cmd, x, y, yaw, *tags = struct.unpack("<BBfff12b", data)
+    assert (pkt, cmd) == (PKT_CMD, CMD_GOTO_YAW)
+    assert (x, y) == (1.5, -2.0) and yaw == pytest.approx(math.pi / 2)
+    assert tags == [3, 7] + [-1] * 10
+    with pytest.raises(ValueError):
+        build_goto_yaw(0, 0, math.nan)

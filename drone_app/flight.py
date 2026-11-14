@@ -6,7 +6,9 @@ The whole trajectory is uploaded first; the ESP32 then plays it on its own
 20 Hz clock (position + velocity feedforward to PX4), so WiFi latency and
 jitter do not set the playback timing. Fresh flight feedback is still required.
 
-CSV: columns t,x,y,z (s, NED m); a header row and '#' comments are allowed.
+CSV: columns t,x,y,z or t,x,y,z,yaw_deg (s, NED m, degrees); a header row
+and '#' comments are allowed. Explicit yaw is absolute NED heading: 0 =
+North/+x and positive turns clockwise.
 The trajectory is flown relative to where the drone hovers when it starts.
 Z is down-positive; constant CSV Z means no climb. TF01 telemetry enables
 verified takeoff and height monitoring. Older firmware is detected automatically:
@@ -33,11 +35,13 @@ from protocol import (
     CMD_HOLD,
     CMD_LAND,
     CMD_START,
-    NAV_TRAJ, NAV_ARRIVED, MISSION_READY, MISSION_FLYING,
-    TRAJ_MAX_PTS,
+    NAV_ROTATING, NAV_TRAJ, NAV_ARRIVED, MISSION_READY, MISSION_FLYING,
+    TRAJ_MAX_PTS, TRAJ_MAX_YAW_RATE_RAD_S, TRAJ_MAX_YAW_ACCEL_RAD_S2,
     CommandPacket,
     build_traj_packets,
     build_traj_start,
+    build_traj_yaw_packets,
+    build_traj_yaw_start,
 )
 
 logging.basicConfig(
@@ -93,7 +97,12 @@ class FlightOptions:
 
 
 def load_trajectory(path: str, dt: float) -> np.ndarray:
-    """Strict t,x,y,z CSV; preserve the endpoint, return first-point offsets."""
+    """Load XYZ or XYZ+yaw CSV and resample it at ``dt``.
+
+    Returned XYZ values are offsets from the first point. If ``yaw_deg`` is
+    present, the fourth returned column is absolute NED yaw in radians. Yaw is
+    unwrapped before interpolation so every sample follows the shortest turn.
+    """
     if not math.isfinite(dt) or dt <= 0:
         raise ValueError("Sample interval must be finite and positive")
     rows = []
@@ -103,17 +112,25 @@ def load_trajectory(path: str, dt: float) -> np.ndarray:
             if not line:
                 continue
             cells = next(csv.reader([line]))
-            if not rows and [c.strip().lower() for c in cells] == ["t", "x", "y", "z"]:
-                continue
+            if not rows:
+                header = [c.strip().lower() for c in cells]
+                if header in (["t", "x", "y", "z"],
+                              ["t", "x", "y", "z", "yaw_deg"]):
+                    continue
             try:
                 values = [float(c) for c in cells]
-                if len(values) != 4 or not all(math.isfinite(v) for v in values):
+                if len(values) not in (4, 5) or not all(math.isfinite(v) for v in values):
+                    raise ValueError()
+                if rows and len(values) != len(rows[0]):
                     raise ValueError()
             except ValueError:
-                raise ValueError(f"{path}:{line_number}: expected four finite t,x,y,z values") from None
+                raise ValueError(
+                    f"{path}:{line_number}: expected finite t,x,y,z values, "
+                    "optionally followed by yaw_deg"
+                ) from None
             rows.append(values)
     if len(rows) < 2:
-        raise ValueError(f"{path}: need at least two t,x,y,z rows")
+        raise ValueError(f"{path}: need at least two trajectory rows")
     data = np.asarray(rows)
     t = data[:, 0] - data[0, 0]
     if np.any(np.diff(t) <= 0):
@@ -123,8 +140,29 @@ def load_trajectory(path: str, dt: float) -> np.ndarray:
         raise ValueError(f"{count} points > {TRAJ_MAX_PTS}; use a larger --dt or shorter route")
     # Last partial interval is padded with a hold, never truncated.
     tq = np.arange(count) * dt
-    pts = np.column_stack([np.interp(tq, t, data[:, c]) for c in (1, 2, 3)])
-    return pts - pts[0]
+    xyz = np.column_stack([np.interp(tq, t, data[:, c]) for c in (1, 2, 3)])
+    xyz -= xyz[0]
+    if data.shape[1] == 4:
+        return xyz
+
+    yaw_unwrapped = np.unwrap(np.deg2rad(data[:, 4]))
+    yaw = np.interp(tq, t, yaw_unwrapped)
+    rates = np.diff(yaw) / dt
+    accelerations = np.diff(np.concatenate(([0.0], rates, [0.0]))) / dt
+    max_rate = float(np.max(np.abs(rates)))
+    max_accel = float(np.max(np.abs(accelerations)))
+    if max_rate > TRAJ_MAX_YAW_RATE_RAD_S + 1e-6:
+        raise ValueError(
+            f"{path}: peak yaw rate {math.degrees(max_rate):.2f} deg/s exceeds "
+            f"{math.degrees(TRAJ_MAX_YAW_RATE_RAD_S):.0f} deg/s"
+        )
+    if max_accel > TRAJ_MAX_YAW_ACCEL_RAD_S2 + 1e-6:
+        raise ValueError(
+            f"{path}: peak yaw acceleration {math.degrees(max_accel):.2f} deg/s^2 "
+            f"exceeds {math.degrees(TRAJ_MAX_YAW_ACCEL_RAD_S2):.0f} deg/s^2"
+        )
+    yaw = (yaw + math.pi) % (2 * math.pi) - math.pi
+    return np.column_stack((xyz, yaw))
 
 
 class FlightFeedback:
@@ -262,7 +300,13 @@ def run_flight(comms, feedback, pts, options, *, confirm=None, control=None, on_
             raise RuntimeError("Without --takeoff, a stable armed OFFBOARD hover is required")
 
         traj_id = random.randint(1, 255)
-        packets = [] if pts is None else build_traj_packets(traj_id, pts)
+        yaw_trajectory = pts is not None and pts.ndim == 2 and pts.shape[1] == 4
+        if pts is None:
+            packets = []
+        elif yaw_trajectory:
+            packets = build_traj_yaw_packets(traj_id, pts)
+        else:
+            packets = build_traj_packets(traj_id, pts)
 
         def upload():
             stage("Uploading trajectory")
@@ -301,7 +345,8 @@ def run_flight(comms, feedback, pts, options, *, confirm=None, control=None, on_
             stage("Takeoff wait complete; holding")
             return
         stage("Starting trajectory")
-        start = build_traj_start(traj_id, dt_ms)
+        start = (build_traj_yaw_start(traj_id, dt_ms) if yaw_trajectory
+                 else build_traj_start(traj_id, dt_ms))
         origin = None
         for attempt in range(3):
             origin = check_packet()
@@ -310,13 +355,17 @@ def run_flight(comms, feedback, pts, options, *, confirm=None, control=None, on_
             if not control.send_raw(comms, args.drone_id, start):
                 raise ConnectionError("Trajectory START could not be sent")
             try:
-                wait(lambda p: p.nav_state == NAV_TRAJ, 1.5, require_flying=extended)
+                accepted_states = (NAV_ROTATING, NAV_TRAJ) if yaw_trajectory else (NAV_TRAJ,)
+                wait(lambda p: p.nav_state in accepted_states, 1.5, require_flying=extended)
                 break
             except TimeoutError:
                 # Only re-upload if fresh feedback proves playback never started.
                 if check_packet().nav_state == NAV_ARRIVED or attempt == 2:
                     raise RuntimeError("Trajectory start was not confirmed")
                 upload()
+        if yaw_trajectory and check_packet().nav_state != NAV_TRAJ:
+            stage("Aligning to first trajectory yaw")
+            wait(lambda p: p.nav_state == NAV_TRAJ, 15.0, require_flying=extended)
         stage("Flying trajectory")
         log.info("Playing trajectory %d (%.1f s)", traj_id, duration)
         def trajectory_done(packet):
@@ -327,7 +376,7 @@ def run_flight(comms, feedback, pts, options, *, confirm=None, control=None, on_
         wait(trajectory_done, duration + 5.0, require_flying=extended)
         stage("Checking endpoint")
         if extended:
-            target = np.array([origin.ned_x, origin.ned_y, origin.local_z]) + pts[-1]
+            target = np.array([origin.ned_x, origin.ned_y, origin.local_z]) + pts[-1, :3]
             wait(lambda p: np.linalg.norm(np.array([p.ned_x, p.ned_y, p.local_z]) - target) < 0.15
                           and abs(p.local_vz) < 0.10, 10.0, stable_for=1.0, require_flying=True)
             log.info("Trajectory endpoint reached; measured local z=%.3f", check_packet().local_z)

@@ -36,6 +36,9 @@ CMD_SET_PEERS     = 0x06   # update nearby drone positions for inter-drone avoid
 CMD_CAMERA_STREAM = 0x07   # camera preview keepalive
 CMD_TRAJ_DATA     = 0x08   # trajectory chunk upload
 CMD_TRAJ_START    = 0x09   # play the uploaded trajectory
+CMD_GOTO_YAW      = 0x0A   # navigate to (goal_x, goal_y) at an explicit yaw
+CMD_TRAJ_YAW_DATA = 0x0B   # trajectory chunk upload with per-point yaw
+CMD_TRAJ_YAW_START = 0x0C  # play an uploaded explicit-yaw trajectory
 
 VFH_BINS    = 32
 
@@ -243,6 +246,23 @@ def build_command(cmd: CommandPacket) -> bytes:
                        cmd.goal_x, cmd.goal_y, *tag_ids)
 
 
+_GOTO_YAW_FMT = "<BBfff12b"   # matches wifi_goto_yaw_pkt_t (26 bytes)
+
+
+def build_goto_yaw(goal_x: float, goal_y: float, yaw_rad: float,
+                   found_tag_ids: Optional[list] = None) -> bytes:
+    """CMD_GOTO_YAW: fly to map (goal_x, goal_y) while facing yaw_rad.
+
+    yaw_rad is an absolute NED heading: 0 = North/+x, clockwise positive.
+    The drone rotates in place first, then translates holding that yaw.
+    """
+    if not all(math.isfinite(v) for v in (goal_x, goal_y, yaw_rad)):
+        raise ValueError("goal and yaw must be finite")
+    tags = ((found_tag_ids or []) + [-1] * MAX_FOUND_TAGS)[:MAX_FOUND_TAGS]
+    return struct.pack(_GOTO_YAW_FMT, PKT_CMD, CMD_GOTO_YAW,
+                       goal_x, goal_y, yaw_rad, *tags)
+
+
 CAMERA_STREAM_MAX_FPS     = 15
 CAMERA_STREAM_MIN_QUALITY = 10
 CAMERA_STREAM_MAX_QUALITY = 90
@@ -326,6 +346,9 @@ def parse_camera_chunk(data: bytes) -> Optional[CameraChunk]:
 
 TRAJ_MAX_PTS   = 2400   # must match NAV_TRAJ_MAX_PTS in nav_task.h
 TRAJ_CHUNK_PTS = 80     # 8 + 80*12 = 968 B, fits WIFI_CMD_BUF_SIZE (1024)
+TRAJ_YAW_CHUNK_PTS = 60 # 8 + 60*16 = 968 B, fits WIFI_CMD_BUF_SIZE (1024)
+TRAJ_MAX_YAW_RATE_RAD_S = math.radians(45.0)
+TRAJ_MAX_YAW_ACCEL_RAD_S2 = math.radians(90.0)
 
 
 def build_traj_packets(traj_id: int, pts) -> list[bytes]:
@@ -346,6 +369,27 @@ def build_traj_packets(traj_id: int, pts) -> list[bytes]:
 def build_traj_start(traj_id: int, dt_ms: int) -> bytes:
     """CMD_TRAJ_START: play upload traj_id, one point every dt_ms."""
     return struct.pack("<BBBH", PKT_CMD, CMD_TRAJ_START, traj_id, dt_ms)
+
+
+def build_traj_yaw_packets(traj_id: int, pts) -> list[bytes]:
+    """CMD_TRAJ_YAW_DATA chunks with (x, y, z, yaw_rad) float32 points.
+
+    Position is relative to the first CSV point. Yaw is an absolute NED
+    heading: 0 = North/+x and positive turns clockwise.
+    """
+    out = []
+    for off in range(0, len(pts), TRAJ_YAW_CHUNK_PTS):
+        chunk = pts[off:off + TRAJ_YAW_CHUNK_PTS]
+        buf = struct.pack("<BBBHHB", PKT_CMD, CMD_TRAJ_YAW_DATA, traj_id,
+                          len(pts), off, len(chunk))
+        buf += b"".join(struct.pack("<ffff", *p) for p in chunk)
+        out.append(buf)
+    return out
+
+
+def build_traj_yaw_start(traj_id: int, dt_ms: int) -> bytes:
+    """CMD_TRAJ_YAW_START: align to first yaw, then play at dt_ms."""
+    return struct.pack("<BBBH", PKT_CMD, CMD_TRAJ_YAW_START, traj_id, dt_ms)
 
 
 # ---------------------------------------------------------------------------

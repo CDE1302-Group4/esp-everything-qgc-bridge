@@ -78,6 +78,17 @@ typedef struct __attribute__((packed)) {
     int8_t   found_tag_ids[WIFI_MAX_FOUND_TAGS]; /* −1 = unused slot           */
 } wifi_cmd_pkt_t;
 
+/* Backward-compatible explicit-yaw waypoint packet. yaw is absolute NED
+ * radians (0 = North/+x, clockwise positive). */
+typedef struct __attribute__((packed)) {
+    uint8_t  pkt_type;
+    uint8_t  cmd_type;                      /* CMD_GOTO_YAW                    */
+    float    goal_x;
+    float    goal_y;
+    float    goal_yaw;
+    int8_t   found_tag_ids[WIFI_MAX_FOUND_TAGS];
+} wifi_goto_yaw_pkt_t;
+
 #define CMD_GOTO          0x01
 #define CMD_LAND          0x02
 #define CMD_HOLD          0x03
@@ -87,8 +98,11 @@ typedef struct __attribute__((packed)) {
 #define CMD_CAMERA_STREAM 0x07   /* keepalive: pkt, cmd, enable, max_fps, quality */
 #define CMD_TRAJ_DATA     0x08   /* pkt, cmd, id, total(u16), offset(u16), n, n × (x,y,z) f32 */
 #define CMD_TRAJ_START    0x09   /* pkt, cmd, id, dt_ms(u16) */
+#define CMD_GOTO_YAW      0x0A   /* pkt, cmd, x(f32), y(f32), yaw(f32), found tags */
+#define CMD_TRAJ_YAW_DATA 0x0B   /* pkt, cmd, id, total, offset, n, n × (x,y,z,yaw) f32 */
+#define CMD_TRAJ_YAW_START 0x0C  /* pkt, cmd, id, dt_ms(u16) */
 
-/* Largest command datagram (a CMD_TRAJ_DATA chunk of 80 points is 968 B). */
+/* Largest command datagram: legacy 80-point XYZ or 60-point XYZ+yaw = 968 B. */
 #define WIFI_CMD_BUF_SIZE 1024
 
 /* ---------------------------------------------------------------------------

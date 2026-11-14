@@ -28,6 +28,10 @@ typedef struct {
     nav_state_t state;
     float goal_map_x, goal_map_y;   /* goal in MAP frame (north, east)          */
     float goal_z;                   /* NED down (negative = above ground)       */
+    float goal_yaw;                 /* absolute NED yaw when goal_has_yaw       */
+    float align_x, align_y;          /* fixed odom position during initial yaw   */
+    bool  goal_has_yaw;             /* false = automatically face travel bearing */
+    bool  goal_aligning_initial;     /* explicit-yaw pre-translation alignment   */
     bool  has_goal;
     float prev_steering_rad;    /* VFH prev input for continuity                */
     uint32_t stuck_count;       /* lifetime stuck events                        */
@@ -38,14 +42,17 @@ static nav_status_t      s_status;
 static SemaphoreHandle_t s_mutex;
 
 /* Uploaded trajectory. Only written while not playing (checked under s_mutex). */
-typedef struct { float x, y, z; } traj_pt_t;
+typedef struct { float x, y, z, yaw; } traj_pt_t;
 
 static traj_pt_t *s_traj;          /* PSRAM; offsets from first point, NaN x = not received */
 static uint16_t   s_traj_n;        /* points in the current upload                */
 static uint8_t    s_traj_id;       /* current upload id, 0 = none / already played */
+static bool       s_traj_upload_has_yaw;
 static uint16_t   s_traj_dt_ms;
 static float      s_traj_org[3];   /* odom position where playback started        */
 static float      s_traj_yaw;
+static bool       s_traj_use_yaw;  /* per-point absolute yaw instead of fixed yaw */
+static bool       s_traj_aligning; /* rotate to first yaw before starting clock   */
 static int64_t    s_traj_t0_us;
 
 /* ---------------------------------------------------------------------------
@@ -237,8 +244,9 @@ static void traj_tick(void)
 
     if (k >= (float)last) {
         const traj_pt_t *p = &s_traj[last];
+        float yaw = s_traj_use_yaw ? p->yaw : s_traj_yaw;
         mavlink_set_position_ned(s_traj_org[0] + p->x, s_traj_org[1] + p->y,
-                                 s_traj_org[2] + p->z, s_traj_yaw);
+                                 s_traj_org[2] + p->z, yaw);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         if (s_nav.state == NAV_TRAJ) {
             s_nav.state    = NAV_ARRIVED;
@@ -254,13 +262,18 @@ static void traj_tick(void)
     float a  = k - (float)i;
     float hz = 1000.0f / (float)s_traj_dt_ms;
     const traj_pt_t *p0 = &s_traj[i], *p1 = &s_traj[i + 1];
+    float yaw = s_traj_yaw;
+    if (s_traj_use_yaw) {
+        /* Interpolate through the shortest rotation, including across ±π. */
+        yaw = wrap_pi(p0->yaw + a * wrap_pi(p1->yaw - p0->yaw));
+    }
 
     mavlink_set_position_velocity_ned(
         s_traj_org[0] + p0->x + a * (p1->x - p0->x),
         s_traj_org[1] + p0->y + a * (p1->y - p0->y),
         s_traj_org[2] + p0->z + a * (p1->z - p0->z),
         (p1->x - p0->x) * hz, (p1->y - p0->y) * hz, (p1->z - p0->z) * hz,
-        s_traj_yaw);
+        yaw);
 }
 
 /* ---------------------------------------------------------------------------
@@ -271,7 +284,9 @@ static void traj_tick(void)
 static bool goal_unchanged(const nav_internal_t *nav)
 {
     return s_nav.has_goal && s_nav.goal_map_x == nav->goal_map_x
-                          && s_nav.goal_map_y == nav->goal_map_y;
+                          && s_nav.goal_map_y == nav->goal_map_y
+                          && s_nav.goal_has_yaw == nav->goal_has_yaw
+                          && (!nav->goal_has_yaw || s_nav.goal_yaw == nav->goal_yaw);
 }
 
 static void nav_tick(const vfh_config_t *vfh_cfg)
@@ -279,6 +294,7 @@ static void nav_tick(const vfh_config_t *vfh_cfg)
     /* Snapshot shared state */
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     nav_internal_t nav = s_nav;
+    bool traj_aligning = s_traj_aligning;
     xSemaphoreGive(s_mutex);
 
     /* --- Emergency collision avoidance (pre-empts everything, even idle) --- */
@@ -301,6 +317,31 @@ static void nav_tick(const vfh_config_t *vfh_cfg)
 
     drone_state_t drone = mavlink_get_state();
 
+    /* Explicit-yaw trajectories do not start their playback clock until the
+     * vehicle is actually facing the first requested yaw. Keep the first
+     * trajectory position fixed during alignment. */
+    if (traj_aligning) {
+        float yaw_error = wrap_pi(s_traj[0].yaw - drone.heading);
+        mavlink_set_position_ned(s_traj_org[0] + s_traj[0].x,
+                                 s_traj_org[1] + s_traj[0].y,
+                                 s_traj_org[2] + s_traj[0].z,
+                                 s_traj[0].yaw);
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        if (s_traj_aligning && s_nav.has_goal) {
+            s_status.state = NAV_ROTATING;
+            s_status.heading_error_rad = yaw_error;
+            if (fabsf(yaw_error) <= NAV_YAW_TOL_RAD) {
+                s_traj_aligning = false;
+                s_traj_t0_us = esp_timer_get_time();
+                s_nav.state = NAV_TRAJ;
+                s_status.state = NAV_TRAJ;
+                ESP_LOGI(TAG, "Trajectory yaw aligned — playback clock started");
+            }
+        }
+        xSemaphoreGive(s_mutex);
+        return;
+    }
+
     /* Map → odom (fixed start offset). */
     float goal_x, goal_y;
     map_to_odom(nav.goal_map_x, nav.goal_map_y, &goal_x, &goal_y);
@@ -310,6 +351,37 @@ static void nav_tick(const vfh_config_t *vfh_cfg)
     float dy   = goal_y - drone.y;
     float dist = sqrtf(dx * dx + dy * dy);
 
+    /* atan2(East, North) is NED yaw: 0=North, clockwise positive. Explicit
+     * yaw decouples camera direction from the direction of translation. */
+    float goal_ned_angle = atan2f(dy, dx);
+    float command_yaw = nav.goal_has_yaw ? nav.goal_yaw : goal_ned_angle;
+    float heading_error = wrap_pi(command_yaw - drone.heading);
+
+    /* A new explicit-yaw goal aligns in place before translation. Once
+     * NAV_FLYING, PX4 maintains the requested yaw without repeatedly stopping
+     * the vehicle for small disturbances. */
+    if (nav.goal_has_yaw && nav.goal_aligning_initial
+            && fabsf(heading_error) > NAV_YAW_TOL_RAD) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        bool ok = goal_unchanged(&nav);
+        if (ok) {
+            mavlink_set_position_ned(nav.align_x, nav.align_y, nav.goal_z, command_yaw);
+            s_status.state = NAV_ROTATING;
+            s_status.goal_x = nav.goal_map_x;
+            s_status.goal_y = nav.goal_map_y;
+            s_status.goal_z = nav.goal_z;
+            s_status.dist_to_goal = dist;
+            s_status.heading_error_rad = heading_error;
+        }
+        xSemaphoreGive(s_mutex);
+        return;
+    }
+    if (nav.goal_has_yaw && nav.goal_aligning_initial) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        if (goal_unchanged(&nav)) s_nav.goal_aligning_initial = false;
+        xSemaphoreGive(s_mutex);
+    }
+
     /* Altitude is held by PX4's own position controller via the Z-position
      * field in the mixed velocity/position setpoint — nothing to do here. */
 
@@ -318,23 +390,27 @@ static void nav_tick(const vfh_config_t *vfh_cfg)
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         bool ok = goal_unchanged(&nav);
         if (ok) {
-            mavlink_set_position_ned(goal_x, goal_y, nav.goal_z, drone.heading);
-            s_nav.state    = NAV_ARRIVED;
-            s_nav.has_goal = false;
-            s_status.state = NAV_ARRIVED;
+            mavlink_set_position_ned(goal_x, goal_y, nav.goal_z,
+                                     nav.goal_has_yaw ? command_yaw : drone.heading);
+            if (nav.goal_has_yaw && fabsf(heading_error) > NAV_YAW_TOL_RAD) {
+                s_nav.state = NAV_ROTATING;
+                s_status.state = NAV_ROTATING;
+            } else {
+                s_nav.state    = NAV_ARRIVED;
+                s_nav.has_goal = false;
+                s_status.state = NAV_ARRIVED;
+            }
             s_status.dist_to_goal = dist;
+            s_status.heading_error_rad = heading_error;
         }
         xSemaphoreGive(s_mutex);
-        if (ok) ESP_LOGI(TAG, "Goal reached (dist=%.2f m)", dist);
+        if (ok && (!nav.goal_has_yaw || fabsf(heading_error) <= NAV_YAW_TOL_RAD))
+            ESP_LOGI(TAG, "Goal reached (dist=%.2f m)", dist);
         return;
     }
 
     bool blocked[VFH_BINS] = {false};
     int free_count = VFH_BINS;
-
-    /* ---- NED bearing to goal ----
-     * atan2(East_delta, North_delta) gives NED bearing: 0=North, CW positive */
-    float goal_ned_angle = atan2f(dy, dx);
 
     /* ---- Compute updated state ---- */
     nav_state_t new_state       = NAV_FLYING;
@@ -348,7 +424,7 @@ static void nav_tick(const vfh_config_t *vfh_cfg)
         xSemaphoreGive(s_mutex);
         return;
     }
-    mavlink_set_position_ned(goal_x, goal_y, nav.goal_z, goal_ned_angle);
+    mavlink_set_position_ned(goal_x, goal_y, nav.goal_z, command_yaw);
     s_nav.state             = new_state;
     s_nav.prev_steering_rad = new_steering;
     s_nav.stuck_count       = new_stuck_count;
@@ -358,7 +434,7 @@ static void nav_tick(const vfh_config_t *vfh_cfg)
     s_status.goal_y            = nav.goal_map_y;
     s_status.goal_z            = nav.goal_z;
     s_status.dist_to_goal      = dist;
-    s_status.heading_error_rad = wrap_pi(goal_ned_angle - drone.heading);
+    s_status.heading_error_rad = heading_error;
     s_status.vfh_steering_rad  = new_steering;
     s_status.free_bins         = free_count;
     s_status.stuck_count       = new_stuck_count;
@@ -390,8 +466,11 @@ void nav_set_goal_map(float map_x, float map_y, float z)
     s_nav.goal_map_x      = map_x;
     s_nav.goal_map_y      = map_y;
     s_nav.goal_z          = z;
+    s_nav.goal_has_yaw    = false;
+    s_nav.goal_aligning_initial = false;
     s_nav.has_goal        = true;
     s_nav.state           = NAV_ROTATING;
+    s_traj_aligning       = false;
     s_nav.prev_steering_rad = 0.0f;
     xSemaphoreGive(s_mutex);
 
@@ -402,12 +481,43 @@ void nav_set_goal_map(float map_x, float map_y, float z)
     ESP_LOGI(TAG, "Goal set: map (%.2f, %.2f) z=%.2f", map_x, map_y, z);
 }
 
+void nav_set_goal_map_yaw(float map_x, float map_y, float z, float yaw)
+{
+    if (!isfinite(map_x) || !isfinite(map_y) || !isfinite(z) || !isfinite(yaw)) {
+        ESP_LOGW(TAG, "Explicit-yaw goal rejected: non-finite value");
+        return;
+    }
+
+    drone_state_t st = mavlink_get_state();
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_nav.goal_map_x      = map_x;
+    s_nav.goal_map_y      = map_y;
+    s_nav.goal_z          = z;
+    s_nav.goal_yaw        = wrap_pi(yaw);
+    s_nav.align_x         = st.x;
+    s_nav.align_y         = st.y;
+    s_nav.goal_has_yaw    = true;
+    s_nav.goal_aligning_initial = true;
+    s_nav.has_goal        = true;
+    s_nav.state           = NAV_ROTATING;
+    s_traj_aligning       = false;
+    s_nav.prev_steering_rad = 0.0f;
+    xSemaphoreGive(s_mutex);
+
+    /* nav_tick replaces this with a position hold carrying the requested yaw. */
+    mavlink_set_hold();
+    ESP_LOGI(TAG, "Explicit-yaw goal: map (%.2f, %.2f) z=%.2f yaw=%.1f deg",
+             map_x, map_y, z, yaw * 180.0f / (float)M_PI);
+}
+
 void nav_cancel(void)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool active    = s_nav.has_goal;
     s_nav.state    = NAV_IDLE;
     s_nav.has_goal = false;
+    s_nav.goal_aligning_initial = false;
+    s_traj_aligning = false;
     s_status.state = NAV_IDLE;
     xSemaphoreGive(s_mutex);
 
@@ -427,21 +537,63 @@ void nav_traj_put(uint8_t id, uint16_t total, uint16_t offset,
     }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    bool playing = (s_nav.state == NAV_TRAJ);
+    bool playing = (s_nav.state == NAV_TRAJ || s_traj_aligning);
     if (!playing) {
-        if (id != s_traj_id || total != s_traj_n) {     /* new upload */
-            for (int i = 0; i < total; i++) s_traj[i].x = NAN;
+        if (id != s_traj_id || total != s_traj_n || s_traj_upload_has_yaw) {
+            for (int i = 0; i < total; i++) {
+                s_traj[i].x = NAN;
+                s_traj[i].yaw = NAN;
+            }
             s_traj_id = id;
             s_traj_n  = total;
+            s_traj_upload_has_yaw = false;
         }
-        memcpy(&s_traj[offset], xyz, (size_t)n * sizeof(traj_pt_t));
+        const uint8_t *src = (const uint8_t *)xyz;
+        for (int i = 0; i < n; i++) {
+            /* Input is packed on the wire; memcpy is safe for unaligned floats. */
+            memcpy(&s_traj[offset + i].x, src + (size_t)i * 12u, 12u);
+            s_traj[offset + i].yaw = NAN;
+        }
     }
     xSemaphoreGive(s_mutex);
 
     if (playing) ESP_LOGW(TAG, "Trajectory chunk ignored — playing");
 }
 
-void nav_traj_start(uint8_t id, uint16_t dt_ms)
+void nav_traj_put_yaw(uint8_t id, uint16_t total, uint16_t offset,
+                      const void *xyzyaw, int n)
+{
+    if (id == 0 || total < 2 || total > NAV_TRAJ_MAX_PTS || n <= 0
+            || offset + n > total) {
+        ESP_LOGW(TAG, "Bad yaw trajectory chunk (id=%u total=%u off=%u n=%d)",
+                 id, total, offset, n);
+        return;
+    }
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool playing = (s_nav.state == NAV_TRAJ || s_traj_aligning);
+    if (!playing) {
+        if (id != s_traj_id || total != s_traj_n || !s_traj_upload_has_yaw) {
+            for (int i = 0; i < total; i++) {
+                s_traj[i].x = NAN;
+                s_traj[i].yaw = NAN;
+            }
+            s_traj_id = id;
+            s_traj_n  = total;
+            s_traj_upload_has_yaw = true;
+        }
+        const uint8_t *src = (const uint8_t *)xyzyaw;
+        for (int i = 0; i < n; i++) {
+            memcpy(&s_traj[offset + i], src + (size_t)i * 16u, 16u);
+            s_traj[offset + i].yaw = wrap_pi(s_traj[offset + i].yaw);
+        }
+    }
+    xSemaphoreGive(s_mutex);
+
+    if (playing) ESP_LOGW(TAG, "Yaw trajectory chunk ignored — playing/alignment active");
+}
+
+static void nav_traj_start_common(uint8_t id, uint16_t dt_ms, bool use_yaw)
 {
     drone_state_t st = mavlink_get_state();
     bool flying = st.armed && st.custom_main_mode == PX4_MAIN_MODE_OFFBOARD
@@ -450,23 +602,55 @@ void nav_traj_start(uint8_t id, uint16_t dt_ms)
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     if (s_nav.state == NAV_TRAJ)          err = "already playing";
+    else if (s_traj_aligning)             err = "yaw alignment already active";
     else if (id == 0 || id != s_traj_id) err = "unknown upload id";
     else if (dt_ms == 0)                 err = "dt_ms is 0";
     else if (!flying)                    err = "not armed in OFFBOARD";
+    else if (s_traj_upload_has_yaw != use_yaw) err = "upload/start format mismatch";
     for (int i = 0; !err && i < s_traj_n; i++) {
-        if (isnan(s_traj[i].x)) err = "upload incomplete";
+        if (!isfinite(s_traj[i].x) || !isfinite(s_traj[i].y)
+                || !isfinite(s_traj[i].z)
+                || (use_yaw && !isfinite(s_traj[i].yaw))) {
+            err = "upload incomplete or non-finite";
+        }
+    }
+    if (!err && use_yaw) {
+        float dt_s = (float)dt_ms / 1000.0f;
+        float previous_rate = 0.0f;
+        for (int i = 1; !err && i < s_traj_n; i++) {
+            float rate = wrap_pi(s_traj[i].yaw - s_traj[i - 1].yaw) / dt_s;
+            if (fabsf(rate) > NAV_TRAJ_MAX_YAW_RATE_RAD_S) {
+                err = "yaw rate exceeds limit";
+            } else if (fabsf(rate - previous_rate) / dt_s
+                       > NAV_TRAJ_MAX_YAW_ACCEL_RAD_S2) {
+                err = "yaw acceleration exceeds limit";
+            }
+            previous_rate = rate;
+        }
+        if (!err && fabsf(previous_rate) / dt_s > NAV_TRAJ_MAX_YAW_ACCEL_RAD_S2)
+            err = "final yaw deceleration exceeds limit";
     }
     if (!err) {
         s_traj_org[0] = st.x;
         s_traj_org[1] = st.y;
         s_traj_org[2] = st.z;
         s_traj_yaw    = st.heading;
+        s_traj_use_yaw = use_yaw;
         s_traj_dt_ms  = dt_ms;
-        s_traj_t0_us  = esp_timer_get_time();
         s_traj_id     = 0;              /* consume: a repeated START cannot replay */
-        s_nav.state    = NAV_TRAJ;
         s_nav.has_goal = true;
-        s_status.state = NAV_TRAJ;
+        s_nav.goal_has_yaw = false;
+        if (use_yaw) {
+            s_traj_aligning = true;
+            s_nav.state = NAV_ROTATING;
+            s_status.state = NAV_ROTATING;
+            s_status.heading_error_rad = wrap_pi(s_traj[0].yaw - st.heading);
+        } else {
+            s_traj_aligning = false;
+            s_traj_t0_us = esp_timer_get_time();
+            s_nav.state = NAV_TRAJ;
+            s_status.state = NAV_TRAJ;
+        }
     }
     uint16_t n = s_traj_n;
     xSemaphoreGive(s_mutex);
@@ -474,9 +658,20 @@ void nav_traj_start(uint8_t id, uint16_t dt_ms)
     if (err) {
         ESP_LOGW(TAG, "Trajectory start refused: %s", err);
     } else {
-        ESP_LOGI(TAG, "Trajectory start: %u pts @ %u ms from odom (%.2f, %.2f, %.2f)",
+        ESP_LOGI(TAG, "%s trajectory start: %u pts @ %u ms from odom (%.2f, %.2f, %.2f)",
+                 use_yaw ? "Explicit-yaw" : "Fixed-yaw",
                  n, dt_ms, st.x, st.y, st.z);
     }
+}
+
+void nav_traj_start(uint8_t id, uint16_t dt_ms)
+{
+    nav_traj_start_common(id, dt_ms, false);
+}
+
+void nav_traj_start_yaw(uint8_t id, uint16_t dt_ms)
+{
+    nav_traj_start_common(id, dt_ms, true);
 }
 
 nav_status_t nav_get_status(void)

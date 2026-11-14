@@ -40,8 +40,11 @@ class Route:
             raise ValueError("Sample interval must be between 0.001 and 1 second")
         dt_ms = round(dt * 1000)
         points = load_trajectory(str(path), dt_ms / 1000)
-        speed = float(np.linalg.norm(np.diff(points, axis=0), axis=1).max() * 1000 / dt_ms)
-        if speed > max_speed + 1e-6:
+        speed = float(np.linalg.norm(np.diff(points[:, :3], axis=0), axis=1).max()
+                      * 1000 / dt_ms)
+        # 1e-4 m/s absorbs the rounding of 6-decimal CSV coordinates, so a
+        # route generated at exactly max_speed is not rejected.
+        if speed > max_speed + 1e-4:
             raise ValueError(f"Peak speed {speed:.3f} m/s exceeds {max_speed:.2f} m/s")
         points.setflags(write=False)
         return cls(Path(path).resolve(), points, dt_ms, (len(points) - 1) * dt_ms / 1000, speed)

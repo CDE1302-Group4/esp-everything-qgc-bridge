@@ -23,6 +23,10 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 static const char *TAG = "wifi";
 
 #define WIFI_CONNECTED_BIT  BIT0
@@ -194,6 +198,26 @@ static void handle_command(const wifi_cmd_pkt_t *cmd)
     }
 }
 
+/* CMD_GOTO_YAW: pkt, cmd, map_x(f32), map_y(f32), yaw_rad(f32), tags[12]. */
+static void handle_goto_yaw(const uint8_t *buf, int len)
+{
+    if (len < (int)sizeof(wifi_goto_yaw_pkt_t)) {
+        ESP_LOGW(TAG, "CMD_GOTO_YAW truncated (%d < %u)", len,
+                 (unsigned)sizeof(wifi_goto_yaw_pkt_t));
+        return;
+    }
+    wifi_goto_yaw_pkt_t cmd;
+    memcpy(&cmd, buf, sizeof(cmd));
+    at_detect_set_known_tags(cmd.found_tag_ids, WIFI_MAX_FOUND_TAGS);
+    if (s_phase != MISSION_FLYING) {
+        ESP_LOGW(TAG, "CMD_GOTO_YAW ignored — not flying");
+        return;
+    }
+    nav_set_goal_map_yaw(cmd.goal_x, cmd.goal_y, -(WIFI_CRUISE_ALT_M), cmd.goal_yaw);
+    ESP_LOGI(TAG, "CMD_GOTO_YAW map(%.2f,%.2f) yaw=%.1f deg",
+             cmd.goal_x, cmd.goal_y, cmd.goal_yaw * 180.0f / (float)M_PI);
+}
+
 /* Parse and apply a CMD_SET_NAV_TAGS packet */
 static void handle_nav_tags(const uint8_t *buf, int len)
 {
@@ -304,6 +328,22 @@ static void handle_traj_data(const uint8_t *buf, int len)
     nav_traj_put(buf[2], total, offset, buf + 8, n);
 }
 
+/* CMD_TRAJ_YAW_DATA: pkt, cmd, id, total(u16), offset(u16), n,
+ * n × (x,y,z,yaw) float32. A 60-point chunk is 968 bytes. */
+static void handle_traj_yaw_data(const uint8_t *buf, int len)
+{
+    if (len < 8) return;
+    uint16_t total, offset;
+    memcpy(&total,  buf + 3, sizeof(total));
+    memcpy(&offset, buf + 5, sizeof(offset));
+    int n = buf[7];
+    if (len < 8 + n * 16) {
+        ESP_LOGW(TAG, "CMD_TRAJ_YAW_DATA truncated (%d < %d)", len, 8 + n * 16);
+        return;
+    }
+    nav_traj_put_yaw(buf[2], total, offset, buf + 8, n);
+}
+
 /* CMD_TRAJ_START: pkt, cmd, id, dt_ms(u16) */
 static void handle_traj_start(const uint8_t *buf, int len)
 {
@@ -315,6 +355,19 @@ static void handle_traj_start(const uint8_t *buf, int len)
     uint16_t dt_ms;
     memcpy(&dt_ms, buf + 3, sizeof(dt_ms));
     nav_traj_start(buf[2], dt_ms);
+}
+
+/* CMD_TRAJ_YAW_START: same header as legacy START, but requires per-point yaw. */
+static void handle_traj_yaw_start(const uint8_t *buf, int len)
+{
+    if (len < 5) return;
+    if (s_phase != MISSION_FLYING) {
+        ESP_LOGW(TAG, "CMD_TRAJ_YAW_START ignored — not flying");
+        return;
+    }
+    uint16_t dt_ms;
+    memcpy(&dt_ms, buf + 3, sizeof(dt_ms));
+    nav_traj_start_yaw(buf[2], dt_ms);
 }
 
 wifi_peer_list_t wifi_get_peers(void)
@@ -405,6 +458,12 @@ void wifi_task(void *arg)
                     handle_traj_data(cmd_buf, len);
                 } else if (cmd_buf[1] == CMD_TRAJ_START) {
                     handle_traj_start(cmd_buf, len);
+                } else if (cmd_buf[1] == CMD_GOTO_YAW) {
+                    handle_goto_yaw(cmd_buf, len);
+                } else if (cmd_buf[1] == CMD_TRAJ_YAW_DATA) {
+                    handle_traj_yaw_data(cmd_buf, len);
+                } else if (cmd_buf[1] == CMD_TRAJ_YAW_START) {
+                    handle_traj_yaw_start(cmd_buf, len);
                 } else if (cmd_buf[1] == CMD_CAMERA_STREAM) {
                     handle_camera_stream(cmd_buf, len, source.sin_addr.s_addr);
                 } else if (cmd_buf[1] == CMD_SET_NAV_TAGS) {

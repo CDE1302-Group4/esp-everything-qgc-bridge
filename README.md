@@ -289,3 +289,36 @@ python laptop/tag_stream.py --esp-ip 192.168.1.204 --plot-output laptop/tags.png
 python laptop/send_trajectory.py --takeoff --takeoff-wait 12 --trajectory trajectory/ellipse_min_snap_traj.csv --confirm --drone-id 4
 
 python drone_app/app.py
+## 7. Windows setup and combined camera/trajectory use
+
+The repository's `flash_drone.sh` is a Bash script intended for macOS/Linux. It temporarily configures `sdkconfig`, verifies the generated firmware, flashes the selected board, and restores `sdkconfig`. It is not directly runnable from PowerShell because it expects Bash and Unix serial paths.
+
+On Windows, use an ESP-IDF PowerShell terminal:
+
+```powershell
+idf.py menuconfig
+idf.py build
+idf.py -p COM4 flash monitor
+```
+
+For drone ID 4, configure the ESP32 as `192.168.1.204` and the laptop as `192.168.1.104`, with gateway `192.168.1.1` and netmask `255.255.255.0`. The drone address is `192.168.1.(200 + ID)` and the telemetry/QGC host address is `192.168.1.(100 + ID)`. The checked-in `sdkconfig` is currently configured for drone 22 (`.222` / `.122`), so verify the physical drone ID before flashing.
+
+`laptop/tag_stream.py` receives camera JPEGs on UDP 5009, detects AprilTags on the laptop with the firmware-compatible detector, and displays an OpenCV camera window plus Matplotlib plots. The left plot shows tag positions relative to the drone; the right plot is a persistent map relative to the initial drone position and heading. Displayed tag coordinates are `forward`, `right`, and `down` in the drone body frame. The permanent map adds telemetry position and yaw, but is not an absolute GPS or arena frame.
+
+Run the viewer alone with direct telemetry:
+
+```powershell
+python laptop/tag_stream.py --esp-ip 192.168.1.204 --telem-port 5005
+```
+
+It does not arm or fly the drone. The permanent map is saved automatically as `tag_stream_plot_*.png`; choose a path with `--plot-output laptop/tags.png`.
+
+`laptop/send_trajectory.py` validates a `t,x,y,z` CSV, resamples it, uploads the full trajectory to the ESP32, and lets the firmware play it onboard. It uses telemetry UDP 5005 and command UDP 5006. While running, it mirrors telemetry locally to UDP 5010 so `tag_stream.py` can run alongside it.
+
+```powershell
+python laptop/send_trajectory.py --drone-id 4 --trajectory trajectory/ellipse_min_snap_traj.csv --dry-run
+python laptop/tag_stream.py --esp-ip 192.168.1.204 --plot-output laptop/tags.png
+python laptop/send_trajectory.py --drone-id 4 --takeoff --takeoff-wait 12 --confirm --trajectory trajectory/ellipse_min_snap_traj.csv --finish land
+```
+
+Type `TRAJ-4` at the confirmation prompt. Use `--finish hold` to hover at the final point instead of landing. When the trajectory sender is running, leave `tag_stream.py` on its default telemetry mirror port 5010; do not use `--telem-port 5005`. Test flight commands with propellers removed first.
