@@ -1,5 +1,9 @@
 # esp-everything-qgc-bridge
 
+| Trajectory simulator | Drone Terminal |
+|---|---|
+| ![Simulated flight of the yaw search route: the real nav_task.c firmware flying the course quadrotor model](drone_terminal/docs/simulator.gif) | ![Drone Terminal menu: choosing a route, checking status and opening the simulator](drone_terminal/docs/terminal_menu.gif) |
+
 ESP32-S3 companion-computer firmware for CDE1302.
 It consists of ESP32 firmware in `main/` and laptop-side Python scripts in `laptop/`.
 
