@@ -6,36 +6,49 @@
     python -m drone_terminal.trajectory_sim --ideal    # no disturbances
 
 The CSV goes through the same loader and sample interval the terminal
-uploads, and the ESP32 side is replayed as the firmware runs it:
+uploads. The ESP32's decisions come from the real firmware: main/nav_task.c
+(with vfh.c and odom.c) is compiled for the laptop by firmware_host.py and
+its own nav_task() loop runs in lockstep with the simulation, so editing the
+C code changes the simulation on the next run (it rebuilds automatically):
 
-- After take-off the drone hovers for a few seconds to settle, then START.
-  Positions are offsets from where PX4 *thinks* the drone is at START.
-- ``t,x,y,z`` (legacy): the setpoint heading is the heading at START.
-- ``t,x,y,z,yaw_deg``: the drone holds position and turns to the first yaw;
-  the playback clock starts once the yaw error is under 0.1 rad.
-- Setpoints (position + velocity feed-forward + yaw) are refreshed at the
-  firmware's 10 Hz nav tick and reach PX4 after a short link delay.
-- After the last point the drone holds it until it has stayed within
-  0.15 m for 1 s, the flight runner's landing condition.
+- The route is uploaded with nav_traj_put[_yaw] in the terminal's chunks.
+- After take-off the drone hovers for a few seconds, then the terminal's
+  START calls nav_traj_start[_yaw]; the firmware's own checks can refuse it.
+- Whatever the firmware streams through the mavlink_task setpoint API
+  (position, position + velocity, hold, ...) is what simulated PX4 tracks,
+  after a short link delay; firmware log lines are printed to the console.
+- After the firmware reports the route done, the laptop's flight runner
+  waits until the drone has stayed within 0.15 m for 1 s before landing.
 
-The drone is not a perfect follower. A PX4-style cascaded controller
-(position P -> velocity PID -> tilt-limited acceleration with attitude lag)
-flies a point mass that is pushed around by:
+The drone follows the CDE1302 multirotor model (Lecture 4) and flight
+control structure (Lecture 5), with parameters from the course's identified
+quadrotor (m = 0.302 kg, J, c_T, c_M, motor curve, T_m = 0.02 s):
+
+- motor dynamics: w = (C_R * throttle + w_b) / (T_m s + 1) per rotor;
+- forces/moments: X4 allocation, thrust c_T w^2, yaw torque c_M w^2;
+- 6-DOF rigid body: m dv/dt = m g e3 - f R e3 + drag + disturbance,
+  J dw/dt = -w x J w + tau, Euler-angle kinematics dTheta/dt = W(Theta) w;
+- control, as in PX4: position P (+ velocity feed-forward from the ESP32)
+  -> velocity PID -> acceleration mapped to tilt and thrust (tilt limited)
+  -> attitude P -> angular-rate PI -> control allocation -> motors.
+
+On top of that it is pushed around by:
 
 - turbulence (random gusts, stronger within 0.5 m of a wall: prop wash
   recirculating off the wall), a slow steady draft, and motor vibration;
-- aerodynamic drag;
+- linear aerodynamic drag and angular damping;
 - an imperfect position estimate (optical-flow drift + noise), so PX4
   controls what it believes, not where the drone really is;
-- yaw disturbances and a 45 deg/s yaw-rate limit.
+- small random roll/pitch/yaw torques, and a 45 deg/s yaw-rate limit.
 
 Walls of the flying area are solid: touching one is counted as a contact and
 the drone bounces off (the firmware's ToF collision avoidance is disabled).
-The constants are representative of a small indoor quad, not identified from
+The disturbance levels and PX4 gains are typical values, not identified on
 our drone, so treat the result as "what kind of errors to expect".
 
 The plot is a true top-down view: North (x) to the right, East (y) down.
 Keys: Space pause, R restart, N new random flight, D disturbances on/off,
+S result window (also opens by itself when the flight ends),
 +/- speed, L loop, Q close.
 """
 
@@ -59,6 +72,9 @@ import numpy as np  # noqa: E402
 
 from drone_terminal.flight import load_trajectory  # noqa: E402
 from drone_terminal.app import TRAJECTORY_DIR, fit_csv_dt  # noqa: E402
+from drone_terminal.firmware_host import (  # noqa: E402
+    NAV_IDLE, NAV_ROTATING, NAV_TRAJ, SP_HOLD, SP_POS_VEL, SP_POSITION,
+    SP_VEL_XY_POS_Z, Firmware)
 
 # Studio 1 flying area, relative to the launch-zone centre (metres, NED).
 FLIGHT_X = (-0.45, 4.95)
@@ -68,34 +84,50 @@ SEARCH_XY = (0.90, -1.35, 3.60, 3.15)
 TAG_CANDIDATES = tuple((x, y) for y in (1.35, -0.90) for x in (0.99, 2.25, 3.51))
 
 # --- Firmware / flight-runner timing ---------------------------------------
-NAV_DT = 0.10              # nav_task tick: setpoint refresh (10 Hz)
+TRAJ_ID = 1                # upload id the terminal uses
 LINK_DELAY = 0.04          # ESP32 -> PX4 UART + PX4 scheduling
-YAW_TOL = 0.1              # NAV_YAW_TOL_RAD: alignment done
 SETTLE_BEFORE_S = 3.0      # hover after take-off before START is sent
 END_TOL_M, END_HOLD_S = 0.15, 1.0   # flight runner: endpoint before landing
 END_TIMEOUT_S = 10.0
 
-# --- PX4-like controller (defaults in brackets are PX4 parameter names) -----
-PHYS_DT = 0.01
-KP_POS = 0.95              # MPC_XY_P
-KP_VEL, KI_VEL = 1.8, 0.4  # MPC_XY_VEL_P_ACC, MPC_XY_VEL_I_ACC
-VEL_MAX = 2.0              # m/s (offboard feed-forward + correction)
-TILT_MAX = math.radians(35.0)
-TAU_ATT = 0.12             # s, attitude loop + motor lag
-KP_YAW = 2.8               # MC_YAW_P
-YAW_RATE_MAX = math.radians(45.0)   # MPC_YAWRAUTO_MAX
-TAU_YAW = 0.15
+# --- Quadrotor model: CDE1302 Lecture 4/5 identified parameters ------------
 G = 9.81
+MASS = 0.302                         # kg
+ARM = 0.0775                         # m, body centre to rotor
+J = (3.9195e-4, 4.0515e-4, 6.3890e-4)   # kg m^2 (Jxx, Jyy, Jzz)
+C_T = 2.9265e-7                      # N/(rad/s)^2, thrust coefficient
+C_M = 4.7345e-9                      # N m/(rad/s)^2, torque coefficient
+C_R, W_B = 3480.7, 445.7799          # throttle -> motor speed: w = C_R*u + w_b
+T_M = 0.02                           # s, motor + propeller time constant
+LIN_DRAG = 0.25                      # 1/s, drag by linear velocity
+ANG_DAMP = 0.002                     # N m s/rad, damping moment by angular rate
+
+# --- PX4 control (parameter names in comments; typical defaults) ------------
+PHYS_DT = 0.005                      # physics + attitude/rate loop (200 Hz)
+POS_EVERY = 4                        # position/velocity loop at 50 Hz
+REC_DT = 0.01                        # recorded / animated samples
+KP_XY, KP_Z = 0.95, 1.0              # MPC_XY_P, MPC_Z_P
+VEL_XY_MAX, VEL_Z_MAX = 2.0, 1.0     # m/s
+KV_XY = (1.8, 0.4, 0.2)              # MPC_XY_VEL_P/I/D_ACC
+KV_Z = (4.0, 2.0, 0.0)               # MPC_Z_VEL_P/I/D_ACC
+TILT_MAX = math.radians(35.0)        # MPC_TILTMAX_AIR
+THR_MAX = 0.9                        # MPC_THR_MAX (fraction of max thrust)
+K_ATT = (6.5, 6.5, 2.8)              # MC_ROLL_P, MC_PITCH_P, MC_YAW_P
+RATE_MAX = (math.radians(220.0), math.radians(220.0), math.radians(45.0))
+K_RATE_P = (20.0, 20.0, 10.0)        # angular-rate P (1/s), scaled by J
+K_RATE_I = (5.0, 5.0, 2.0)
+CRUISE_ALT = 0.5                     # m, main.c CRUISE_ALT_M
+YAW_RATE_MAX = RATE_MAX[2]           # MPC_YAWRAUTO_MAX
 
 # --- Disturbances (scaled by --wind; 0 = ideal) ----------------------------
 GUST_SIGMA, GUST_TAU = 0.18, 1.5    # m/s^2, s (turbulence)
 WALL_ZONE_M, WALL_GAIN = 0.5, 1.5   # gusts up to (1 + gain)x near walls
 DRAFT_ACC = 0.05                    # m/s^2 steady draft (aircon, doors)
 VIBRATION = 0.4                     # m/s^2 white motor/prop vibration
-DRAG = 0.35                         # 1/m, quadratic drag
 DRIFT = 0.005                       # m/sqrt(s), flow position drift
 EST_NOISE, EST_VEL_NOISE = 0.01, 0.03
-YAW_NOISE = math.radians(8.0)       # rad/s/sqrt(s) yaw disturbance
+ATT_NOISE = 0.25                    # rad/s/sqrt(s) roll/pitch torque noise
+YAW_NOISE = math.radians(8.0)       # rad/s/sqrt(s) yaw torque noise
 TAKEOFF_POS_ERR, TAKEOFF_VEL = 0.07, 0.15   # leftover take-off motion
 
 DRONE_RADIUS = 0.15
@@ -130,183 +162,305 @@ class Plan:
         self.yaw = np.unwrap(pts[:, 3]) if self.has_yaw else None
         self.travel = travel_heading(self.x, self.y)
         self.play_s = (len(pts) - 1) * self.dt
+        self.pts = pts            # what the terminal uploads to the firmware
 
-    def sample(self, k: float):
-        """Interpolated (x, y, vx, vy, yaw, yaw_rate) at fractional index k."""
-        last = len(self.x) - 1
-        if k >= last:
-            yaw = float(self.yaw[last]) if self.has_yaw else None
-            return float(self.x[last]), float(self.y[last]), 0.0, 0.0, yaw, 0.0
-        i = int(k)
-        a = k - i
-        x = self.x[i] + a * (self.x[i + 1] - self.x[i])
-        y = self.y[i] + a * (self.y[i + 1] - self.y[i])
-        vx = (self.x[i + 1] - self.x[i]) / self.dt
-        vy = (self.y[i + 1] - self.y[i]) / self.dt
-        if not self.has_yaw:
-            return float(x), float(y), float(vx), float(vy), None, 0.0
-        yaw = self.yaw[i] + a * (self.yaw[i + 1] - self.yaw[i])
-        rate = (self.yaw[i + 1] - self.yaw[i]) / self.dt
-        return float(x), float(y), float(vx), float(vy), float(yaw), float(rate)
+
+def setpoint_to_cmd(sp, est_yaw: float):
+    """What PX4 tracks for a firmware setpoint (types as in mavlink_task.c).
+
+    Returns (pos_ctl, x, y, vx_ff, vy_ff, z or None, vz_ff, yaw or None, yaw_rate).
+    """
+    yaw = sp.yaw if math.isfinite(sp.yaw) else est_yaw   # HOLD keeps the heading
+    if sp.type == SP_POS_VEL:
+        return (True, sp.x, sp.y, sp.vx, sp.vy, sp.z, sp.vz, yaw, 0.0)
+    if sp.type in (SP_POSITION, SP_HOLD):
+        return (True, sp.x, sp.y, 0.0, 0.0, sp.z, 0.0, yaw, 0.0)
+    if sp.type == SP_VEL_XY_POS_Z:
+        return (False, 0.0, 0.0, sp.vx, sp.vy, sp.z, 0.0, yaw, 0.0)
+    return (False, 0.0, 0.0, sp.vx, sp.vy, None, sp.vz, None, sp.yaw_rate)
+
+
+def _allocation():
+    """X4 allocation (Lecture 4): [f, tx, ty, tz] = M [w1^2 .. w4^2]."""
+    k = ARM * C_T * math.sqrt(2) / 2
+    m = np.array([[C_T, C_T, C_T, C_T],
+                  [-k, k, k, -k],
+                  [k, -k, k, -k],
+                  [C_M, C_M, -C_M, -C_M]])
+    return m, np.linalg.inv(m)
+
+
+ALLOC, ALLOC_INV = _allocation()
+W_MAX = C_R + W_B
+W_HOVER = math.sqrt(MASS * G / (4 * C_T))
 
 
 class Flight:
-    """One simulated flight, precomputed at PHYS_DT."""
+    """One simulated flight, precomputed at PHYS_DT, recorded at REC_DT."""
 
     def __init__(self, plan: Plan, seed: int, wind: float):
         self.seed, self.wind = seed, wind
         rng = np.random.default_rng(seed)
         s = wind
-        sq = math.sqrt(PHYS_DT)
+        dt = PHYS_DT
+        sq = math.sqrt(dt)
+        cos, sin, tan = math.cos, math.sin, math.tan
+        Jx, Jy, Jz = J
+        M, Minv = ALLOC.tolist(), ALLOC_INV.tolist()
+        gust_k = GUST_SIGMA * math.sqrt(2 * dt / GUST_TAU)
+        f_max = THR_MAX * 4 * C_T * W_MAX ** 2
 
-        pos = rng.normal(0.0, TAKEOFF_POS_ERR * s, 2)
-        vel = rng.normal(0.0, TAKEOFF_VEL * s, 2)
-        acc = np.zeros(2)
-        yaw = plan.start_heading + rng.normal(0.0, math.radians(3.0) * s)
-        yaw_rate = 0.0
-        vel_int = np.zeros(2)
-        gust = np.zeros(2)
-        bias = np.zeros(2)
-        noise_lp = np.zeros(2)
-        vnoise_lp = np.zeros(2)
-        angle = rng.uniform(0, 2 * math.pi)
-        draft = DRAFT_ACC * s * np.array((math.cos(angle), math.sin(angle)))
-
-        phase = 0
-        org = np.zeros(2)          # firmware s_traj_org (estimated position)
-        held_yaw = plan.start_heading
-        t0 = 0.0
-        settle_start = settle_ok = None
-        cmd = (np.zeros(2), np.zeros(2), plan.start_heading, 0.0)   # active at PX4
-        pending = []               # (time active, command)
-        plan_xy = np.zeros(2)
-
-        rec = {k: [] for k in ("t", "x", "y", "yaw", "ex", "ey", "sx", "sy",
-                               "px", "py", "ax", "ay", "phase", "wall", "hit")}
-        self.contacts = 0
-        last_touch = -1e9          # scraping along a wall counts as one contact
-        t = 0.0
-        step = 0
-        nav_every = round(NAV_DT / PHYS_DT)
-        done_at = None
         t_cap = SETTLE_BEFORE_S + 30.0 + plan.play_s + END_TIMEOUT_S + 2.0
+        n_steps = int(t_cap / dt) + 2
+        # All random numbers up front (much faster than drawing per step).
+        noise = (rng.normal(0.0, 1.0, (n_steps, 16)) * s).tolist()
 
-        while True:
-            # --- what PX4 believes (EKF with optical flow) ---------------------
-            bias += rng.normal(0.0, DRIFT * s * sq, 2)
-            noise_lp += (rng.normal(0.0, EST_NOISE * s, 2) - noise_lp) * 0.2
-            vnoise_lp += (rng.normal(0.0, EST_VEL_NOISE * s, 2) - vnoise_lp) * 0.2
-            est = pos + bias + noise_lp
-            est_vel = vel + vnoise_lp
-            est_yaw = yaw + rng.normal(0.0, math.radians(0.5) * s)
+        # --- true state (NED) ---
+        px, py = (float(v) for v in rng.normal(0.0, TAKEOFF_POS_ERR * s, 2))
+        pz = -CRUISE_ALT
+        vx, vy = (float(v) for v in rng.normal(0.0, TAKEOFF_VEL * s, 2))
+        vz = 0.0
+        phi = theta = 0.0
+        psi = plan.start_heading + float(rng.normal(0.0, math.radians(3.0) * s))
+        wp = wq = wr = 0.0                       # body angular rates p, q, r
+        rotor = [W_HOVER] * 4
+        # --- environment ---
+        gx = gy = 0.0
+        ang = rng.uniform(0, 2 * math.pi)
+        draft_x, draft_y = DRAFT_ACC * s * cos(ang), DRAFT_ACC * s * sin(ang)
+        # --- estimator errors ---
+        bx = by = 0.0
+        nx = ny = nvx = nvy = 0.0
+        lp = min(1.0, 0.2 * dt / 0.01)
+        # --- controller state ---
+        ix = iy = iz = 0.0                       # velocity integrators
+        irp = irq = irr = 0.0                    # rate integrators
+        prev_v = (vx, vy, vz)
+        acc_f = [0.0, 0.0, 0.0]                  # filtered acceleration (D term)
+        phi_d = theta_d = 0.0
+        f_d = MASS * G
 
-            # --- ESP32 nav tick: firmware state machine + new setpoint ---------
-            if step % nav_every == 0:
-                if phase == 0 and t >= SETTLE_BEFORE_S:
-                    org = est.copy()
-                    held_yaw = est_yaw
-                    if plan.has_yaw:
-                        held_yaw += wrap_pi(plan.yaw[0] - est_yaw)   # short turn
-                        phase = 1
-                    else:
-                        phase, t0 = 2, t
-                elif phase == 1 and abs(wrap_pi(plan.yaw[0] - est_yaw)) <= YAW_TOL:
-                    phase, t0 = 2, t
-                if phase == 0:
-                    sp = (np.zeros(2), np.zeros(2), plan.start_heading, 0.0)
-                    plan_xy = np.zeros(2)
-                elif phase == 1:
-                    x0, y0 = plan.x[0], plan.y[0]
-                    sp = (org + (x0, y0), np.zeros(2), held_yaw, 0.0)
-                    plan_xy = np.array((x0, y0))
-                else:
-                    k = (t - t0) / plan.dt
-                    x, y, vx, vy, pyaw, prate = plan.sample(k)
-                    if plan.has_yaw:
-                        pyaw += held_yaw - plan.yaw[0]
-                    else:
-                        pyaw, prate = held_yaw, 0.0
-                    sp = (org + (x, y), np.array((vx, vy)), pyaw, prate)
-                    plan_xy = np.array((x, y))
-                    if phase == 2 and k >= len(plan.x) - 1:
+        # --- the real firmware (main/nav_task.c), compiled for the laptop ---
+        fw = Firmware()
+        fw.reset()
+        fw_t0 = fw.now()
+        fw.upload(TRAJ_ID, plan.pts)            # same chunks as the terminal
+        dt_ms = round(plan.dt * 1000)
+        started = False
+        start_t = 0.0
+        # --- laptop flight runner state ---
+        phase = 0
+        settle_start = settle_ok = None
+        end_target = (0.0, 0.0)
+        self.refused = False
+        # Before START, mission_task holds the take-off point.
+        hover = (True, 0.0, 0.0, 0.0, 0.0, -CRUISE_ALT, 0.0, plan.start_heading, 0.0)
+        cmd = hover                              # setpoint active at PX4
+        pending = []
+        plan_x = plan_y = 0.0
+        last = len(plan.x) - 1
+
+        rec = {k: [] for k in ("t", "x", "y", "z", "yaw", "roll", "pitch", "ex", "ey",
+                               "sx", "sy", "px", "py", "ax", "ay", "phase", "wall", "hit")}
+        self.contacts = 0
+        last_touch = -1e9
+        rec_every = round(REC_DT / dt)
+        done_at = None
+        hit_since_rec = touching_since_rec = False
+        step = 0
+        t = 0.0
+
+        while step < n_steps:
+            r = noise[step]
+            # --- what PX4 believes (EKF2 with optical flow) --------------------
+            bx += DRIFT * sq * r[0]
+            by += DRIFT * sq * r[1]
+            nx += (EST_NOISE * r[2] - nx) * lp
+            ny += (EST_NOISE * r[3] - ny) * lp
+            nvx += (EST_VEL_NOISE * r[4] - nvx) * lp
+            nvy += (EST_VEL_NOISE * r[5] - nvy) * lp
+            ex, ey, ez = px + bx + nx, py + by + ny, pz
+            evx, evy, evz = vx + nvx, vy + nvy, vz
+            epsi = psi + 0.0087 * r[6]
+
+            # --- ESP32: the firmware sees PX4's estimate over MAVLink -----------
+            fw.set_state(ex, ey, ez, evx, evy, evz, wrap_pi(epsi))
+            if not started and t >= SETTLE_BEFORE_S:
+                fw.start(TRAJ_ID, dt_ms, plan.has_yaw)     # the terminal's START
+                started, start_t = True, t
+            if fw.advance(dt) and started and phase < 4:   # a nav_task() loop ran
+                state = fw.nav_state()
+                if state == NAV_ROTATING:
+                    phase = 1
+                    plan_x, plan_y = float(plan.x[0]), float(plan.y[0])
+                elif state == NAV_TRAJ:
+                    phase = 2
+                    k = min(max(fw.traj_progress(), 0.0), last)
+                    i = min(int(k), last - 1)
+                    a = k - i
+                    plan_x = float(plan.x[i] + a * (plan.x[i + 1] - plan.x[i]))
+                    plan_y = float(plan.y[i] + a * (plan.y[i + 1] - plan.y[i]))
+                elif state == NAV_IDLE and phase == 0 and t - start_t > 0.5:
+                    self.refused = True                    # firmware refused START
+                    phase = 4
+                elif phase >= 1:
+                    # Playback over (ARRIVED); the laptop flight runner waits
+                    # for the drone to settle on the end point before landing.
+                    if phase < 3:
                         phase, settle_start = 3, t
-                    if phase == 3:
-                        near = np.linalg.norm(est - sp[0]) < END_TOL_M
-                        settle_ok = (settle_ok or t) if near else None
-                        if ((settle_ok is not None and t - settle_ok >= END_HOLD_S)
-                                or t - settle_start > END_TIMEOUT_S):
-                            phase = 4
-                pending.append((t + LINK_DELAY, sp))
+                        plan_x, plan_y = float(plan.x[last]), float(plan.y[last])
+                    sp_now = fw.setpoint()
+                    if math.isfinite(sp_now.x):
+                        end_target = (sp_now.x, sp_now.y)
+                    near = math.hypot(ex - end_target[0], ey - end_target[1]) < END_TOL_M
+                    settle_ok = (settle_ok or t) if near else None
+                    if ((settle_ok is not None and t - settle_ok >= END_HOLD_S)
+                            or t - settle_start > END_TIMEOUT_S):
+                        phase = 4
+                if phase >= 1:
+                    pending.append((t + LINK_DELAY, setpoint_to_cmd(fw.setpoint(), epsi)))
             while pending and pending[0][0] <= t:
                 cmd = pending.pop(0)[1]
+            pos_ctl, spx, spy, ffx, ffy, sp_z, ffz, sp_yaw, sp_rate = cmd
 
-            # --- PX4 position + velocity control ---------------------------------
-            sp_pos, sp_vel, sp_yaw, sp_rate = cmd
-            vel_cmd = sp_vel + KP_POS * (sp_pos - est)
-            speed = np.linalg.norm(vel_cmd)
-            if speed > VEL_MAX:
-                vel_cmd *= VEL_MAX / speed
-            err_v = vel_cmd - est_vel
-            vel_int = np.clip(vel_int + err_v * PHYS_DT, -1.0, 1.0)
-            acc_cmd = KP_VEL * err_v + KI_VEL * vel_int
-            a_max = G * math.tan(TILT_MAX)
-            norm = np.linalg.norm(acc_cmd)
-            if norm > a_max:
-                acc_cmd *= a_max / norm
-            acc += (acc_cmd - acc) * PHYS_DT / TAU_ATT        # tilt takes time
+            # --- PX4 position + velocity control (50 Hz) -------------------------
+            if step % POS_EVERY == 0:
+                dtp = dt * POS_EVERY
+                # Position loop only for setpoints that carry a position
+                # (PX4 bypasses it for velocity setpoints).
+                cvx = ffx + (KP_XY * (spx - ex) if pos_ctl else 0.0)
+                cvy = ffy + (KP_XY * (spy - ey) if pos_ctl else 0.0)
+                mag = math.hypot(cvx, cvy)
+                if mag > VEL_XY_MAX:
+                    cvx, cvy = cvx * VEL_XY_MAX / mag, cvy * VEL_XY_MAX / mag
+                cvz = ffz + (KP_Z * (sp_z - ez) if sp_z is not None else 0.0)
+                cvz = max(-VEL_Z_MAX, min(VEL_Z_MAX, cvz))
+                e_vx, e_vy, e_vz = cvx - evx, cvy - evy, cvz - evz
+                ix = max(-1.0, min(1.0, ix + e_vx * dtp))
+                iy = max(-1.0, min(1.0, iy + e_vy * dtp))
+                iz = max(-1.0, min(1.0, iz + e_vz * dtp))
+                acc_f[0] += ((evx - prev_v[0]) / dtp - acc_f[0]) * 0.3
+                acc_f[1] += ((evy - prev_v[1]) / dtp - acc_f[1]) * 0.3
+                acc_f[2] += ((evz - prev_v[2]) / dtp - acc_f[2]) * 0.3
+                prev_v = (evx, evy, evz)
+                adx = KV_XY[0] * e_vx + KV_XY[1] * ix - KV_XY[2] * acc_f[0]
+                ady = KV_XY[0] * e_vy + KV_XY[1] * iy - KV_XY[2] * acc_f[1]
+                adz = KV_Z[0] * e_vz + KV_Z[1] * iz - KV_Z[2] * acc_f[2]
+                # Acceleration -> thrust vector (Lecture 5): A = a_d - g e3.
+                Ax, Ay, Az = adx, ady, min(adz - G, -0.2 * G)
+                h = math.hypot(Ax, Ay)
+                h_max = -Az * tan(TILT_MAX)
+                if h > h_max:
+                    Ax, Ay = Ax * h_max / h, Ay * h_max / h
+                An = math.sqrt(Ax * Ax + Ay * Ay + Az * Az)
+                f_d = min(MASS * An, f_max)
+                # Thrust direction -> roll/pitch setpoints in the yaw frame.
+                cpsi, spsi = cos(epsi), sin(epsi)
+                abx = cpsi * Ax + spsi * Ay
+                aby = -spsi * Ax + cpsi * Ay
+                theta_d = math.atan2(-abx, -Az)
+                phi_d = math.asin(max(-1.0, min(1.0, aby / An)))
 
-            # --- environment ----------------------------------------------------
-            gust += (-gust * PHYS_DT / GUST_TAU
-                     + GUST_SIGMA * s * math.sqrt(2 * PHYS_DT / GUST_TAU)
-                     * rng.normal(0.0, 1.0, 2))
-            wall_d = min(pos[0] - FLIGHT_X[0], FLIGHT_X[1] - pos[0],
-                         pos[1] - FLIGHT_Y[0], FLIGHT_Y[1] - pos[1]) - DRONE_RADIUS
+            # --- attitude P -> angular-rate PI (200 Hz) ---------------------------
+            ephi = phi + 0.0035 * r[7]
+            etheta = theta + 0.0035 * r[8]
+            rp_d = max(-RATE_MAX[0], min(RATE_MAX[0], K_ATT[0] * (phi_d - ephi)))
+            rq_d = max(-RATE_MAX[1], min(RATE_MAX[1], K_ATT[1] * (theta_d - etheta)))
+            yaw_cmd = K_ATT[2] * wrap_pi(sp_yaw - epsi) if sp_yaw is not None else sp_rate
+            rr_d = max(-RATE_MAX[2], min(RATE_MAX[2], yaw_cmd))
+            e_p, e_q, e_r = rp_d - wp, rq_d - wq, rr_d - wr
+            irp = max(-0.5, min(0.5, irp + e_p * dt))
+            irq = max(-0.5, min(0.5, irq + e_q * dt))
+            irr = max(-0.5, min(0.5, irr + e_r * dt))
+            u0 = f_d
+            u1 = Jx * (K_RATE_P[0] * e_p + K_RATE_I[0] * irp)
+            u2 = Jy * (K_RATE_P[1] * e_q + K_RATE_I[1] * irq)
+            u3 = Jz * (K_RATE_P[2] * e_r + K_RATE_I[2] * irr)
+
+            # --- control allocation -> throttle -> motor dynamics ----------------
+            for i in range(4):
+                mi = Minv[i]
+                w2 = mi[0] * u0 + mi[1] * u1 + mi[2] * u2 + mi[3] * u3
+                w_cmd = math.sqrt(w2) if w2 > 0.0 else 0.0
+                throttle = (w_cmd - W_B) / C_R
+                throttle = 0.0 if throttle < 0.0 else (1.0 if throttle > 1.0 else throttle)
+                rotor[i] += (C_R * throttle + W_B - rotor[i]) * dt / T_M
+            a0, a1, a2, a3 = (w * w for w in rotor)
+            f = M[0][0] * a0 + M[0][1] * a1 + M[0][2] * a2 + M[0][3] * a3
+            tx = M[1][0] * a0 + M[1][1] * a1 + M[1][2] * a2 + M[1][3] * a3
+            ty = M[2][0] * a0 + M[2][1] * a1 + M[2][2] * a2 + M[2][3] * a3
+            tz = M[3][0] * a0 + M[3][1] * a1 + M[3][2] * a2 + M[3][3] * a3
+
+            # --- rotational dynamics: J dw/dt = -w x Jw + tau ---------------------
+            dp = (tx - (Jz - Jy) * wq * wr - ANG_DAMP * wp) / Jx
+            dq = (ty - (Jx - Jz) * wp * wr - ANG_DAMP * wq) / Jy
+            dr = (tz - (Jy - Jx) * wp * wq - ANG_DAMP * wr) / Jz
+            wp += dp * dt + ATT_NOISE * sq * r[9]
+            wq += dq * dt + ATT_NOISE * sq * r[10]
+            wr += dr * dt + YAW_NOISE * sq * r[11]
+            # Euler kinematics: dTheta/dt = W(Theta) w
+            cphi, sphi, cth, tth = cos(phi), sin(phi), cos(theta), tan(theta)
+            phi += (wp + sphi * tth * wq + cphi * tth * wr) * dt
+            theta += (cphi * wq - sphi * wr) * dt
+            psi += ((sphi * wq + cphi * wr) / cth) * dt
+
+            # --- translational dynamics: m dv/dt = m g e3 - f R e3 + ... ---------
+            cphi, sphi = cos(phi), sin(phi)
+            cth, sth = cos(theta), sin(theta)
+            cps, sps = cos(psi), sin(psi)
+            fm = f / MASS
+            fax = -fm * (cphi * sth * cps + sphi * sps)
+            fay = -fm * (cphi * sth * sps - sphi * cps)
+            faz = -fm * cphi * cth
+            gx += -gx * dt / GUST_TAU + gust_k * r[12]
+            gy += -gy * dt / GUST_TAU + gust_k * r[13]
+            wall_d = min(px - FLIGHT_X[0], FLIGHT_X[1] - px,
+                         py - FLIGHT_Y[0], FLIGHT_Y[1] - py) - DRONE_RADIUS
             wall_f = 1.0 + WALL_GAIN * max(0.0, 1.0 - wall_d / WALL_ZONE_M)
-            disturb = draft + gust * wall_f + rng.normal(0.0, VIBRATION * s, 2)
-            drag = -DRAG * np.linalg.norm(vel) * vel
-            vel += (acc + disturb + drag) * PHYS_DT
-            pos += vel * PHYS_DT
+            vx += (fax - LIN_DRAG * vx + draft_x + gx * wall_f + VIBRATION * r[14]) * dt
+            vy += (fay - LIN_DRAG * vy + draft_y + gy * wall_f + VIBRATION * r[15]) * dt
+            vz += (G + faz - LIN_DRAG * vz + 0.35 * VIBRATION * (r[14] - r[15])) * dt
+            px += vx * dt
+            py += vy * dt
+            pz += vz * dt
 
             # --- solid walls ------------------------------------------------------
             touching = False
-            for axis, (lo, hi) in enumerate((FLIGHT_X, FLIGHT_Y)):
-                if pos[axis] < lo + DRONE_RADIUS:
-                    pos[axis] = lo + DRONE_RADIUS
-                    vel[axis] = abs(vel[axis]) * WALL_RESTITUTION
-                    touching = True
-                elif pos[axis] > hi - DRONE_RADIUS:
-                    pos[axis] = hi - DRONE_RADIUS
-                    vel[axis] = -abs(vel[axis]) * WALL_RESTITUTION
-                    touching = True
-            hit = touching and t - last_touch > 0.5
-            if hit:
+            if px < FLIGHT_X[0] + DRONE_RADIUS:
+                px, vx, touching = FLIGHT_X[0] + DRONE_RADIUS, abs(vx) * WALL_RESTITUTION, True
+            elif px > FLIGHT_X[1] - DRONE_RADIUS:
+                px, vx, touching = FLIGHT_X[1] - DRONE_RADIUS, -abs(vx) * WALL_RESTITUTION, True
+            if py < FLIGHT_Y[0] + DRONE_RADIUS:
+                py, vy, touching = FLIGHT_Y[0] + DRONE_RADIUS, abs(vy) * WALL_RESTITUTION, True
+            elif py > FLIGHT_Y[1] - DRONE_RADIUS:
+                py, vy, touching = FLIGHT_Y[1] - DRONE_RADIUS, -abs(vy) * WALL_RESTITUTION, True
+            if touching and t - last_touch > 0.5:
                 self.contacts += 1
+                hit_since_rec = True
             if touching:
                 last_touch = t
+                touching_since_rec = True
 
-            # --- yaw ----------------------------------------------------------------
-            rate_cmd = float(np.clip(KP_YAW * wrap_pi(sp_yaw - est_yaw) + sp_rate,
-                                     -YAW_RATE_MAX, YAW_RATE_MAX))
-            yaw_rate += (rate_cmd - yaw_rate) * PHYS_DT / TAU_YAW
-            yaw_rate += rng.normal(0.0, YAW_NOISE * s * sq)
-            yaw += yaw_rate * PHYS_DT
-
-            for key, value in (("t", t), ("x", pos[0]), ("y", pos[1]), ("yaw", yaw),
-                               ("ex", est[0]), ("ey", est[1]),
-                               ("sx", sp_pos[0]), ("sy", sp_pos[1]),
-                               ("px", plan_xy[0]), ("py", plan_xy[1]),
-                               ("ax", acc[0]), ("ay", acc[1]),
-                               ("phase", phase), ("wall", touching), ("hit", hit)):
-                rec[key].append(value)
+            if step % rec_every == 0:
+                for key, value in (("t", t), ("x", px), ("y", py), ("z", pz), ("yaw", psi),
+                                   ("roll", phi), ("pitch", theta),
+                                   ("ex", ex), ("ey", ey),
+                                   ("sx", spx if pos_ctl else ex), ("sy", spy if pos_ctl else ey),
+                                   ("px", plan_x), ("py", plan_y), ("ax", fax), ("ay", fay),
+                                   ("phase", phase), ("wall", touching_since_rec),
+                                   ("hit", hit_since_rec)):
+                    rec[key].append(value)
+                hit_since_rec = touching_since_rec = False
 
             if phase == 4 and done_at is None:
                 done_at = t
             step += 1
-            t = step * PHYS_DT
-            # Show 1 s after the landing condition is met; hard cap as a guard.
-            if (done_at is not None and t - done_at > 1.0) or t > t_cap:
+            t = step * dt
+            if done_at is not None and t - done_at > 1.0:
                 break
 
+        self.fw_log = fw.take_log(since=fw_t0)
+        self.fw_name = fw.path.name
         for key, values in rec.items():
             setattr(self, key, np.asarray(values))
         self.duration = float(self.t[-1])
@@ -317,7 +471,7 @@ class Flight:
         self.end_err = float(self.error[-1])
 
     def index_at(self, t: float) -> int:
-        return int(np.clip(round(t / PHYS_DT), 0, len(self.t) - 1))
+        return int(np.clip(round(t / REC_DT), 0, len(self.t) - 1))
 
 
 def quad_shape(x: float, y: float, yaw: float, size: float):
@@ -375,7 +529,7 @@ class Simulation:
             fontsize=9, family="monospace", zorder=20,
             bbox={"boxstyle": "round,pad=0.35", "fc": "white", "alpha": 0.9})
         self.fig.text(0.5, 0.005,
-                      "Space pause   R restart   N new random flight   D disturbances on/off   "
+                      "Space pause   R restart   N new random flight   D disturbances on/off   S result window   "
                       "+/- speed   L loop   Q close", ha="center", va="bottom", fontsize=8.5)
         self.ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8,
                        borderaxespad=0)
@@ -395,6 +549,7 @@ class Simulation:
         wind = self.wind_setting if self.disturbed else 0.0
         self.flight = f = Flight(self.plan, self.seed, wind)
         self.t = 0.0
+        self._summary_shown = False
         self.err_curve.set_data(f.t, f.error)
         self.err_ax.set_xlim(0, f.duration)
         self.err_ax.set_ylim(0, max(0.1, f.error.max() * 1.15))
@@ -410,9 +565,13 @@ class Simulation:
         mode = f"disturbed (seed {f.seed}, wind {f.wind:g}x)" if f.wind else "ideal (no disturbances)"
         self.err_ax.set_title(f"Distance from planned route — {mode}; grey = stabilizing, "
                               "red = yaw alignment, green = settling", fontsize=8.5)
+        for line in f.fw_log[:20]:
+            print(f"[firmware] {line}")
+        if f.refused:
+            print("[sim] the firmware refused START; see its log above")
         print(f"[sim] {mode}: RMS {f.rms_err:.3f} m, max {f.max_err:.3f} m, "
               f"end {f.end_err:.3f} m, wall contacts {f.contacts}, "
-              f"total {f.duration:.1f} s")
+              f"total {f.duration:.1f} s  (firmware build {f.fw_name})")
 
     def _draw_arena(self) -> None:
         ax, p = self.ax, self.plan
@@ -445,6 +604,9 @@ class Simulation:
             self.paused = not self.paused
         elif key == "r":
             self.t, self.paused = 0.0, False
+            self._summary_shown = False
+        elif key == "s":
+            self._show_summary()
         elif key == "n":
             self.seed += 1
             self.disturbed = True
@@ -468,6 +630,9 @@ class Simulation:
         if not self.paused:
             self.t += (now - self.last_clock) * self.speed
             if self.t >= f.duration:
+                if not self._summary_shown:
+                    self._summary_shown = True
+                    self._show_summary()
                 self.t = 0.0 if self.loop else f.duration
         self.last_clock = now
 
@@ -494,16 +659,57 @@ class Simulation:
 
         if self.paused and phase != "COMPLETE":
             phase += " (paused)"
-        tilt_deg = math.degrees(math.atan(math.hypot(f.ax[i], f.ay[i]) / G))
+        roll, pitch = math.degrees(f.roll[i]), math.degrees(f.pitch[i])
         est_off = math.hypot(f.ex[i] - x, f.ey[i] - y)
         self.info.set_text(
             f"t   {f.t[i]:7.2f} / {f.duration:.2f} s   {phase}\n"
-            f"pos {x:+6.2f}, {y:+6.2f} m   yaw {math.degrees(wrap_pi(yaw)):+6.1f} deg\n"
-            f"off route {f.error[i]:.3f} m   tilt {tilt_deg:4.1f} deg\n"
-            f"estimate off by {est_off:.3f} m\n"
+            f"pos {x:+6.2f}, {y:+6.2f} m   alt {-f.z[i]:.2f} m\n"
+            f"roll {roll:+5.1f}  pitch {pitch:+5.1f}  yaw {math.degrees(wrap_pi(yaw)):+6.1f} deg\n"
+            f"off route {f.error[i]:.3f} m   estimate off by {est_off:.3f} m\n"
             f"RMS {f.rms_err:.3f} m  max {f.max_err:.3f} m  walls {f.contacts}\n"
             f"playback {self.speed:.2f}x   loop {'on' if self.loop else 'off'}")
         return ()
+
+    def _show_summary(self):
+        """Open a clean window with just the arena, the route and the flown path."""
+        f, p = self.flight, self.plan
+        fig, ax = plt.subplots(figsize=(8.5, 7))
+        fig.canvas.manager.set_window_title(f"Flight result - {self.path.name}")
+        ax.add_patch(Rectangle((FLIGHT_X[0], FLIGHT_Y[0]), np.diff(FLIGHT_X)[0],
+                               np.diff(FLIGHT_Y)[0], fc="#f5f5f5", ec="#616161", lw=1.8,
+                               zorder=0))
+        for tx, ty in TAG_CANDIDATES:
+            ax.add_patch(Circle((tx, ty), 0.05, fill=False, ec="#424242", zorder=2))
+        ax.plot(p.x, p.y, color="#9e9e9e", lw=1.3, ls="--", label="Planned route", zorder=3)
+        ax.plot(f.x, f.y, color="#ff8c00", lw=1.5, label="Flown (simulated)", zorder=4)
+        hits = np.flatnonzero(f.hit)
+        if len(hits):
+            ax.plot(f.x[hits], f.y[hits], "X", color="#b71c1c", ms=9, zorder=6,
+                    label="Wall contact")
+        ax.plot(f.x[0], f.y[0], "o", color="#2e7d32", ms=8, zorder=6, label="Start")
+        body, rotors = quad_shape(f.x[-1], f.y[-1], f.yaw[-1], self.size)
+        ax.add_patch(Polygon(body, closed=True, fc="#1565c0", ec="white", lw=1.2, zorder=8,
+                             label="Drone (end)"))
+        for centre in rotors:
+            ax.add_patch(Circle(centre, self.size * 0.32, fc="#90caf9", ec="#0d47a1",
+                                lw=1, zorder=7))
+        pad = 0.2
+        ax.set_xlim(min(FLIGHT_X[0], p.x.min()) - pad, max(FLIGHT_X[1], p.x.max()) + pad)
+        ax.set_ylim(min(FLIGHT_Y[0], p.y.min()) - pad, max(FLIGHT_Y[1], p.y.max()) + pad)
+        ax.invert_yaxis()  # same top-down view as the main window
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("x / North (m)  →")
+        ax.set_ylabel("y / East (m)  ↓")
+        ax.grid(True, color="#e0e0e0", lw=0.8)
+        mode = f"seed {f.seed}, wind {f.wind:g}x" if f.wind else "no disturbances"
+        ax.set_title(f"{self.path.name} ({mode})\n"
+                     f"{f.duration:.1f} s, RMS {f.rms_err:.2f} m, max {f.max_err:.2f} m, "
+                     f"{f.contacts} wall contact{'s' * (f.contacts != 1)}", fontsize=10.5)
+        ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8.5, borderaxespad=0)
+        fig.tight_layout()
+        fig.show()
+        self._summary_figs = getattr(self, "_summary_figs", []) + [fig]
+        return fig
 
     def show(self) -> None:
         plt.show()

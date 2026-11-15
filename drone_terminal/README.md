@@ -43,25 +43,38 @@ python -m drone_terminal.trajectory_sim --ideal              # no disturbances
 ```
 
 It uses the same loader and sample interval as the upload, so a CSV the drone
-would refuse fails here too. A simulated drone then flies the route the way
-the firmware plays it:
+would refuse fails here too. The ESP32 side is the real firmware:
+`main/nav_task.c` (with `vfh.c` and `odom.c`) is compiled for the laptop by
+`drone_terminal/firmware_host.py`, with small stand-ins for FreeRTOS,
+MAVLink, ToF and WiFi in `drone_terminal/fw_host/`, and its own `nav_task()`
+loop runs in lockstep with the simulation. Editing that C code (or any
+header in `main/`) changes the simulation: the library is rebuilt
+automatically on the next run (cached in `drone_terminal/.fw-host/`; needs
+gcc, MinGW-w64 on Windows). Firmware log lines are printed to the console.
+A simulated drone then flies whatever the firmware commands:
 
 - It hovers for 3 s after take-off to settle (grey), then START is sent.
   The route is offset from where PX4 *thinks* the drone is at that moment.
 - `t,x,y,z`: the setpoint heading is the heading at START.
 - `t,x,y,z,yaw_deg`: the drone turns on the spot to the first yaw (red) and
   the playback clock starts once the yaw error is under 0.1 rad.
-- Setpoints refresh at the firmware's 10 Hz nav tick, with a short link delay.
+- Setpoints come from the firmware's 20 Hz `nav_task()` loop, with a short link delay.
 - At the end it holds the last point until it has stayed within 0.15 m for
   1 s (green), the flight runner's landing condition.
 
-The drone is flown by a PX4-style controller (position P, velocity PI,
-tilt-limited thrust with attitude lag) and is pushed off the route by
-turbulence (stronger near walls), a steady draft, motor vibration, drag,
-optical-flow drift in the position estimate, and yaw disturbances. Walls are
-solid: contacts are marked with a red X (ToF collision avoidance is disabled
-in the firmware). The constants are typical of a small indoor quad, not
-measured on our drone, so use it to see what kind of errors to expect.
+The drone follows the CDE1302 quadrotor model (Lecture 4) with the course's
+identified parameters (mass, inertia, thrust/torque coefficients, motor
+curve and 0.02 s motor time constant): first-order motor dynamics, X4 force
+and moment allocation, 6-DOF rigid-body dynamics and Euler-angle kinematics.
+It is flown by the Lecture 5 / PX4 cascade: position P with the ESP32's
+velocity feed-forward, velocity PID, acceleration mapped to a tilt-limited
+thrust and attitude setpoint, attitude P, angular-rate PI and control
+allocation. It is pushed off the route by turbulence (stronger near walls),
+a steady draft, motor vibration, drag, optical-flow drift in the position
+estimate, and random roll/pitch/yaw torques. Walls are solid: contacts are
+marked with a red X (ToF collision avoidance is disabled in the firmware).
+The disturbance levels and PX4 gains are typical values, not measured on our
+drone, so use it to see what kind of errors to expect.
 
 On screen: orange is the true flown path, purple is PX4's estimate, the cyan
 circle is the current setpoint, and the yellow line shows which way and how
