@@ -34,15 +34,14 @@ quadrotor (m = 0.302 kg, J, c_T, c_M, motor curve, T_m = 0.02 s):
 
 On top of that it is pushed around by:
 
-- turbulence (random gusts, stronger within 0.5 m of a wall: prop wash
-  recirculating off the wall), a slow steady draft, and motor vibration;
+- turbulence (random gusts), a slow steady draft, and motor vibration;
 - linear aerodynamic drag and angular damping;
 - an imperfect position estimate (optical-flow drift + noise), so PX4
   controls what it believes, not where the drone really is;
 - small random roll/pitch/yaw torques, and a 45 deg/s yaw-rate limit.
 
-Walls of the flying area are solid: touching one is counted as a contact and
-the drone bounces off (the firmware's ToF collision avoidance is disabled).
+The flying area is drawn for reference only; there are no walls, so the
+drone can fly past its edges.
 The disturbance levels and PX4 gains are typical values, not identified on
 our drone, so treat the result as "what kind of errors to expect".
 
@@ -121,7 +120,6 @@ YAW_RATE_MAX = RATE_MAX[2]           # MPC_YAWRAUTO_MAX
 
 # --- Disturbances (scaled by --wind; 0 = ideal) ----------------------------
 GUST_SIGMA, GUST_TAU = 0.18, 1.5    # m/s^2, s (turbulence)
-WALL_ZONE_M, WALL_GAIN = 0.5, 1.5   # gusts up to (1 + gain)x near walls
 DRAFT_ACC = 0.05                    # m/s^2 steady draft (aircon, doors)
 VIBRATION = 0.4                     # m/s^2 white motor/prop vibration
 DRIFT = 0.005                       # m/sqrt(s), flow position drift
@@ -130,8 +128,6 @@ ATT_NOISE = 0.25                    # rad/s/sqrt(s) roll/pitch torque noise
 YAW_NOISE = math.radians(8.0)       # rad/s/sqrt(s) yaw torque noise
 TAKEOFF_POS_ERR, TAKEOFF_VEL = 0.07, 0.15   # leftover take-off motion
 
-DRONE_RADIUS = 0.15
-WALL_RESTITUTION = 0.3
 
 PHASES = ("STABILIZING", "ALIGNING YAW", "PLAYING", "SETTLING", "COMPLETE")
 
@@ -261,12 +257,9 @@ class Flight:
         last = len(plan.x) - 1
 
         rec = {k: [] for k in ("t", "x", "y", "z", "yaw", "roll", "pitch", "ex", "ey",
-                               "sx", "sy", "px", "py", "ax", "ay", "phase", "wall", "hit")}
-        self.contacts = 0
-        last_touch = -1e9
+                               "sx", "sy", "px", "py", "ax", "ay", "phase")}
         rec_every = round(REC_DT / dt)
         done_at = None
-        hit_since_rec = touching_since_rec = False
         step = 0
         t = 0.0
 
@@ -414,32 +407,12 @@ class Flight:
             faz = -fm * cphi * cth
             gx += -gx * dt / GUST_TAU + gust_k * r[12]
             gy += -gy * dt / GUST_TAU + gust_k * r[13]
-            wall_d = min(px - FLIGHT_X[0], FLIGHT_X[1] - px,
-                         py - FLIGHT_Y[0], FLIGHT_Y[1] - py) - DRONE_RADIUS
-            wall_f = 1.0 + WALL_GAIN * max(0.0, 1.0 - wall_d / WALL_ZONE_M)
-            vx += (fax - LIN_DRAG * vx + draft_x + gx * wall_f + VIBRATION * r[14]) * dt
-            vy += (fay - LIN_DRAG * vy + draft_y + gy * wall_f + VIBRATION * r[15]) * dt
+            vx += (fax - LIN_DRAG * vx + draft_x + gx + VIBRATION * r[14]) * dt
+            vy += (fay - LIN_DRAG * vy + draft_y + gy + VIBRATION * r[15]) * dt
             vz += (G + faz - LIN_DRAG * vz + 0.35 * VIBRATION * (r[14] - r[15])) * dt
             px += vx * dt
             py += vy * dt
             pz += vz * dt
-
-            # --- solid walls ------------------------------------------------------
-            touching = False
-            if px < FLIGHT_X[0] + DRONE_RADIUS:
-                px, vx, touching = FLIGHT_X[0] + DRONE_RADIUS, abs(vx) * WALL_RESTITUTION, True
-            elif px > FLIGHT_X[1] - DRONE_RADIUS:
-                px, vx, touching = FLIGHT_X[1] - DRONE_RADIUS, -abs(vx) * WALL_RESTITUTION, True
-            if py < FLIGHT_Y[0] + DRONE_RADIUS:
-                py, vy, touching = FLIGHT_Y[0] + DRONE_RADIUS, abs(vy) * WALL_RESTITUTION, True
-            elif py > FLIGHT_Y[1] - DRONE_RADIUS:
-                py, vy, touching = FLIGHT_Y[1] - DRONE_RADIUS, -abs(vy) * WALL_RESTITUTION, True
-            if touching and t - last_touch > 0.5:
-                self.contacts += 1
-                hit_since_rec = True
-            if touching:
-                last_touch = t
-                touching_since_rec = True
 
             if step % rec_every == 0:
                 for key, value in (("t", t), ("x", px), ("y", py), ("z", pz), ("yaw", psi),
@@ -447,10 +420,8 @@ class Flight:
                                    ("ex", ex), ("ey", ey),
                                    ("sx", spx if pos_ctl else ex), ("sy", spy if pos_ctl else ey),
                                    ("px", plan_x), ("py", plan_y), ("ax", fax), ("ay", fay),
-                                   ("phase", phase), ("wall", touching_since_rec),
-                                   ("hit", hit_since_rec)):
+                                   ("phase", phase)):
                     rec[key].append(value)
-                hit_since_rec = touching_since_rec = False
 
             if phase == 4 and done_at is None:
                 done_at = t
@@ -508,8 +479,6 @@ class Simulation:
         self.trail, = self.ax.plot([], [], color="#ff8c00", lw=1.6, label="Flown (simulated)")
         self.est_trail, = self.ax.plot([], [], color="#7b1fa2", lw=0.8, alpha=0.6,
                                        label="PX4's estimate")
-        self.contact_pts, = self.ax.plot([], [], "X", color="#b71c1c", ms=9, zorder=12,
-                                         label="Wall contact")
         self.ghost, = self.ax.plot([], [], "o", mfc="none", mec="#00e5ff", mew=1.8, ms=10,
                                    zorder=9, label="Setpoint")
         self.err_line, = self.ax.plot([], [], color="#00e5ff", lw=1, ls=":", zorder=9)
@@ -570,7 +539,7 @@ class Simulation:
         if f.refused:
             print("[sim] the firmware refused START; see its log above")
         print(f"[sim] {mode}: RMS {f.rms_err:.3f} m, max {f.max_err:.3f} m, "
-              f"end {f.end_err:.3f} m, wall contacts {f.contacts}, "
+              f"end {f.end_err:.3f} m, "
               f"total {f.duration:.1f} s  (firmware build {f.fw_name})")
 
     def _draw_arena(self) -> None:
@@ -643,7 +612,7 @@ class Simulation:
         phase = PHASES[f.phase[i]]
         colour = {"STABILIZING": "#607d8b", "ALIGNING YAW": "#c62828",
                   "SETTLING": "#2e7d32"}.get(phase, "#1565c0")
-        self.body.set_facecolor("#b71c1c" if f.wall[i] else colour)
+        self.body.set_facecolor(colour)
         for rotor, centre in zip(self.rotors, rotors):
             rotor.center = centre
         # Tilt line: direction and size of the thrust tilt the drone is using.
@@ -653,8 +622,6 @@ class Simulation:
         self.est_trail.set_data(f.ex[:i + 1], f.ey[:i + 1])
         self.ghost.set_data((f.sx[i],), (f.sy[i],))
         self.err_line.set_data((x, f.sx[i]), (y, f.sy[i]))
-        hits = np.flatnonzero(f.hit[:i + 1])
-        self.contact_pts.set_data(f.x[hits], f.y[hits])
         self.err_cursor.set_xdata((f.t[i], f.t[i]))
 
         if self.paused and phase != "COMPLETE":
@@ -666,7 +633,7 @@ class Simulation:
             f"pos {x:+6.2f}, {y:+6.2f} m   alt {-f.z[i]:.2f} m\n"
             f"roll {roll:+5.1f}  pitch {pitch:+5.1f}  yaw {math.degrees(wrap_pi(yaw)):+6.1f} deg\n"
             f"off route {f.error[i]:.3f} m   estimate off by {est_off:.3f} m\n"
-            f"RMS {f.rms_err:.3f} m  max {f.max_err:.3f} m  walls {f.contacts}\n"
+            f"RMS {f.rms_err:.3f} m  max {f.max_err:.3f} m\n"
             f"playback {self.speed:.2f}x   loop {'on' if self.loop else 'off'}")
         return ()
 
@@ -682,10 +649,6 @@ class Simulation:
             ax.add_patch(Circle((tx, ty), 0.05, fill=False, ec="#424242", zorder=2))
         ax.plot(p.x, p.y, color="#9e9e9e", lw=1.3, ls="--", label="Planned route", zorder=3)
         ax.plot(f.x, f.y, color="#ff8c00", lw=1.5, label="Flown (simulated)", zorder=4)
-        hits = np.flatnonzero(f.hit)
-        if len(hits):
-            ax.plot(f.x[hits], f.y[hits], "X", color="#b71c1c", ms=9, zorder=6,
-                    label="Wall contact")
         ax.plot(f.x[0], f.y[0], "o", color="#2e7d32", ms=8, zorder=6, label="Start")
         body, rotors = quad_shape(f.x[-1], f.y[-1], f.yaw[-1], self.size)
         ax.add_patch(Polygon(body, closed=True, fc="#1565c0", ec="white", lw=1.2, zorder=8,
@@ -703,8 +666,8 @@ class Simulation:
         ax.grid(True, color="#e0e0e0", lw=0.8)
         mode = f"seed {f.seed}, wind {f.wind:g}x" if f.wind else "no disturbances"
         ax.set_title(f"{self.path.name} ({mode})\n"
-                     f"{f.duration:.1f} s, RMS {f.rms_err:.2f} m, max {f.max_err:.2f} m, "
-                     f"{f.contacts} wall contact{'s' * (f.contacts != 1)}", fontsize=10.5)
+                     f"{f.duration:.1f} s, RMS {f.rms_err:.2f} m, max {f.max_err:.2f} m",
+                     fontsize=10.5)
         ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8.5, borderaxespad=0)
         fig.tight_layout()
         fig.show()

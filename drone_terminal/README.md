@@ -69,10 +69,10 @@ and moment allocation, 6-DOF rigid-body dynamics and Euler-angle kinematics.
 It is flown by the Lecture 5 / PX4 cascade: position P with the ESP32's
 velocity feed-forward, velocity PID, acceleration mapped to a tilt-limited
 thrust and attitude setpoint, attitude P, angular-rate PI and control
-allocation. It is pushed off the route by turbulence (stronger near walls),
+allocation. It is pushed off the route by turbulence,
 a steady draft, motor vibration, drag, optical-flow drift in the position
-estimate, and random roll/pitch/yaw torques. Walls are solid: contacts are
-marked with a red X (ToF collision avoidance is disabled in the firmware).
+estimate, and random roll/pitch/yaw torques. The flying area is drawn for
+reference only: there are no walls.
 The disturbance levels and PX4 gains are typical values, not measured on our
 drone, so use it to see what kind of errors to expect.
 
