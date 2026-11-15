@@ -4,6 +4,7 @@ build/
 
 # Host build of the in-tree AprilTag detector (laptop/apriltag_host.py)
 laptop/.apriltag-host/
+drone_terminal/.fw-host/
 
 # MATLAB / Simulink
 slprj/

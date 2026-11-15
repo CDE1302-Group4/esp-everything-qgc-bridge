@@ -318,7 +318,7 @@ class TerminalController:
         error = None
         for attempt in range(3):
             try:
-                sent = control.interrupt(self, self.drone_id, CommandPacket(command)) or sent
+                sent = control.interrupt(self, self.drone_id, command) or sent
             except Exception as exc:
                 error = exc
             if attempt < 2:
