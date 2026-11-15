@@ -1,0 +1,6 @@
+# Drone Terminal + trajectory simulator (Python 3.10+).
+#   python -m pip install -r drone_terminal/requirements.txt
+# The simulator also compiles the drone's firmware for the laptop, so it needs
+# a C compiler: gcc (MinGW-w64 on Windows), Xcode command line tools on macOS,
+# build-essential on Linux.
+-r ../laptop/requirements.txt

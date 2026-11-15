@@ -3,6 +3,10 @@
 ESP32-S3 companion-computer firmware for CDE1302.
 It consists of ESP32 firmware in `main/` and laptop-side Python scripts in `laptop/`.
 
+> **Drone Terminal and the trajectory simulator:** a menu app for flying the
+> drone, plus a simulator that runs the real ESP32 navigation firmware on your
+> laptop. See [drone_terminal/README.md](drone_terminal/README.md).
+
 Note that the example drone ID in this README is 22 (it's indicated as [drone ID] in some places). You need to change it to your drone's ID when running the scripts.
 
 ## 1. Setup ESP32 (Optional)

@@ -1,0 +1,91 @@
+ESP32/PX4 Drone Terminal
+Drone ID [0-30] (usually 4): Drone IP [192.168.1.204]: 
+==============================================================
+DRONE TERMINAL | OFFLINE | drone 4 | route: none
+==============================================================
+  1. CONNECT
+  2. SELECT TRAJECTORY
+  3. TAKEOFF AND HOLD
+  4. FLY SELECTED TRAJECTORY
+  5. GOTO COMMAND
+  6. HOLD
+  7. LAND
+  8. OPEN TAG CAMERA + PERMANENT MAP
+  9. OPEN TELEMETRY LOG TERMINAL
+ 10. STATUS
+ 11. DISCONNECT
+ 12. SIMULATE SELECTED TRAJECTORY
+  0. EXIT
+Choose: 
+Trajectories in <repo>\trajectory:
+  1. circle_traj.csv
+  2. ellipse_min_snap_traj.csv
+  3. flying_area_search_5p4x4p5_circles_239s.csv
+  4. flying_area_search_5p4x4p5_circles_400s.csv
+  5. flying_area_search_5p4x4p5_under200s copy.csv
+  6. flying_area_search_5p4x4p5_under200s.csv
+  7. flying_area_search_5p4x4p5_yaw_center_slow.csv
+  8. rect_spiral_2.5x1.8.csv
+  9. rect_spiral_3.6x3.15.csv
+  10. rectangle_min_snap_traj.csv
+  11. rectangle_spiral_2x1_slow.csv
+  0. Cancel
+Choose trajectory: Selected flying_area_search_5p4x4p5_circles_239s.csv: 2396 points, 239.5 s, dt 0.100 s, peak 0.228 m/s
+
+==============================================================
+DRONE TERMINAL | OFFLINE | drone 4 | route: flying_area_search_5p4x4p5_circles_239s.csv
+==============================================================
+  1. CONNECT
+  2. SELECT TRAJECTORY
+  3. TAKEOFF AND HOLD
+  4. FLY SELECTED TRAJECTORY
+  5. GOTO COMMAND
+  6. HOLD
+  7. LAND
+  8. OPEN TAG CAMERA + PERMANENT MAP
+  9. OPEN TELEMETRY LOG TERMINAL
+ 10. STATUS
+ 11. DISCONNECT
+ 12. SIMULATE SELECTED TRAJECTORY
+  0. EXIT
+Choose: Drone: 4 at 192.168.1.204
+Connection: offline
+Operation: idle
+Trajectory: flying_area_search_5p4x4p5_circles_239s.csv
+Telemetry: none received
+
+==============================================================
+DRONE TERMINAL | OFFLINE | drone 4 | route: flying_area_search_5p4x4p5_circles_239s.csv
+==============================================================
+  1. CONNECT
+  2. SELECT TRAJECTORY
+  3. TAKEOFF AND HOLD
+  4. FLY SELECTED TRAJECTORY
+  5. GOTO COMMAND
+  6. HOLD
+  7. LAND
+  8. OPEN TAG CAMERA + PERMANENT MAP
+  9. OPEN TELEMETRY LOG TERMINAL
+ 10. STATUS
+ 11. DISCONNECT
+ 12. SIMULATE SELECTED TRAJECTORY
+  0. EXIT
+Choose: Opened real-time simulation for flying_area_search_5p4x4p5_circles_239s.csv.
+
+==============================================================
+DRONE TERMINAL | OFFLINE | drone 4 | route: flying_area_search_5p4x4p5_circles_239s.csv
+==============================================================
+  1. CONNECT
+  2. SELECT TRAJECTORY
+  3. TAKEOFF AND HOLD
+  4. FLY SELECTED TRAJECTORY
+  5. GOTO COMMAND
+  6. HOLD
+  7. LAND
+  8. OPEN TAG CAMERA + PERMANENT MAP
+  9. OPEN TELEMETRY LOG TERMINAL
+ 10. STATUS
+ 11. DISCONNECT
+ 12. SIMULATE SELECTED TRAJECTORY
+  0. EXIT
+Choose:
