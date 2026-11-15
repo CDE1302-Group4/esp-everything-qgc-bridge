@@ -1,8 +1,10 @@
 # Drone Terminal
 
-Numbered terminal UI for the existing ESP32/PX4 drone stack. It reuses the
-validated `drone_app` flight runner and opens the original
-`laptop/tag_stream.py` process for camera detection and permanent mapping.
+Numbered terminal UI for the existing ESP32/PX4 drone stack. It is
+self-contained: the flight runner (`flight.py`), UDP link (`transport.py`) and
+trajectory generator (`generate_flying_area_search.py`) live in this folder.
+It opens the original `laptop/tag_stream.py` process for camera detection and
+permanent mapping.
 
 Run from the project root after activating the laptop Python environment:
 

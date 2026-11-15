@@ -16,28 +16,22 @@ import time
 
 
 def find_project_root() -> Path:
-    """Find the checkout containing laptop/, trajectory/ and drone_app/."""
+    """Find the checkout containing laptop/ and trajectory/."""
     for candidate in Path(__file__).resolve().parents:
-        if ((candidate / "laptop").is_dir()
-                and (candidate / "trajectory").is_dir()
-                and (candidate / "drone_app").is_dir()):
+        if (candidate / "laptop").is_dir() and (candidate / "trajectory").is_dir():
             return candidate
     raise RuntimeError("Cannot find the project root")
 
 
 PROJECT_ROOT = find_project_root()
 LAPTOP_DIR = PROJECT_ROOT / "laptop"
-DRONE_APP_DIR = PROJECT_ROOT / "drone_app"
-TRAJECTORY_DIR = Path(__file__).resolve().parent.parent / "trajectory"
-if not TRAJECTORY_DIR.is_dir():
-    # Also works while this folder is staged under drone_app/ before installation.
-    TRAJECTORY_DIR = PROJECT_ROOT / "trajectory"
+TRAJECTORY_DIR = PROJECT_ROOT / "trajectory"
 
 for dependency in (str(PROJECT_ROOT), str(LAPTOP_DIR)):
     if dependency not in sys.path:
         sys.path.insert(0, dependency)
 
-from drone_app.flight import (  # noqa: E402
+from drone_terminal.flight import (  # noqa: E402
     FlightCancelled,
     FlightControl,
     FlightFeedback,
@@ -45,7 +39,7 @@ from drone_app.flight import (  # noqa: E402
     load_trajectory,
     run_flight,
 )
-from drone_app.transport import CommsNode  # noqa: E402
+from drone_terminal.transport import CommsNode  # noqa: E402
 from protocol import (  # noqa: E402
     CMD_GOTO,
     CMD_HOLD,

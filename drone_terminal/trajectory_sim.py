@@ -36,7 +36,7 @@ from matplotlib.animation import FuncAnimation  # noqa: E402
 from matplotlib.patches import Circle, Polygon, Rectangle  # noqa: E402
 import numpy as np  # noqa: E402
 
-from drone_app.flight import load_trajectory  # noqa: E402
+from drone_terminal.flight import load_trajectory  # noqa: E402
 from drone_terminal.app import TRAJECTORY_DIR, fit_csv_dt  # noqa: E402
 
 ALIGN_RATE_RAD_S = math.radians(45.0)  # PX4 MPC_YAWRAUTO_MAX default
